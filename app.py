@@ -13,6 +13,19 @@
 import os
 import chromadb
 import streamlit as st
+from dotenv import load_dotenv
+
+BASE = os.path.dirname(__file__)
+
+# ---------- LangSmith 监控配置 ----------
+# 先把 .env 加载进环境变量（本地生效）；云端则从 Secrets 读取覆盖
+load_dotenv(os.path.join(BASE, ".env"))
+try:
+    for _k in ("LANGSMITH_API_KEY", "LANGSMITH_TRACING", "LANGSMITH_PROJECT"):
+        if _k in st.secrets:
+            os.environ[_k] = st.secrets[_k]
+except FileNotFoundError:
+    pass  # 本地没有 secrets.toml，用 .env 的值
 
 BASE = os.path.dirname(__file__)
 
@@ -37,12 +50,16 @@ st.caption("基于手册的 RAG 问答 · 答案只来自所选知识库原文")
 
 # ---------- 初始化模型与向量库（缓存，只在首次运行时执行） ----------
 from openai import OpenAI
+from langsmith import traceable
+from langsmith.wrappers import wrap_openai
 
 @st.cache_resource
 def load_components():
-    embed_client = OpenAI(api_key=SILICONFLOW_KEY,
-                          base_url="https://api.siliconflow.cn/v1")
-    llm = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com")
+    # wrap_openai 给客户端装上"监控探头"：每次 API 调用的耗时、token、
+    # 完整入参出参都会自动上报 LangSmith（smith.langchain.com）
+    embed_client = wrap_openai(OpenAI(api_key=SILICONFLOW_KEY,
+                                      base_url="https://api.siliconflow.cn/v1"))
+    llm = wrap_openai(OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com"))
     db = chromadb.PersistentClient(path=os.path.join(BASE, "db"))
     return embed_client, llm, db
 
@@ -99,6 +116,9 @@ def retrieve(question: str, k: int = 4) -> str:
     res = col.query(query_embeddings=vec.data[0].embedding, n_results=k)
     return "\n----\n".join(res["documents"][0])
 
+# @traceable：每次问答在 LangSmith 生成一条完整追踪记录
+# （调用树：检索 -> 拼 Prompt -> LLM，网页上层层展开查看）
+@traceable
 def ask(question: str):
     """完整 RAG：检索 -> 拼 Prompt -> DeepSeek 流式回答"""
     context = retrieve(question)
