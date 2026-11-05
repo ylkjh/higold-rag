@@ -8,8 +8,8 @@
 
 三层限流（都基于服务端 SQLite，重启不清零）：
     ① 全站 24 小时总配额  —— 最终熔断：真被刷了，最多损失这么多
-    ② 单 IP 24 小时配额   —— 挡住同一个人/同一台机器
-    ③ 单 IP 最小间隔      —— 挡住脚本高频连发（正常人手速达不到）
+    ② 每人 24 小时配额     —— 按访问链接区分到人（没有身份时退化为按 IP）
+    ③ 每人最小间隔         —— 挡住脚本高频连发（正常人手速达不到）
 
 另附答案缓存：同一个问题第二次问不发请求、不花钱。
 """
@@ -33,13 +33,19 @@ def _conn():
 
 
 def init():
-    """建表（幂等，每次启动调用一次即可）"""
+    """建表 + 兼容旧库（幂等，每次启动调用一次即可）"""
     with _LOCK, _conn() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS usage(
                          id INTEGER PRIMARY KEY AUTOINCREMENT,
                          ts REAL NOT NULL,
-                         ip TEXT NOT NULL)""")
+                         ip TEXT,
+                         who TEXT)""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage(ts)")
+        # 旧版只有 ip 列，补上 who 列（避免升级后报 no such column）
+        cols = [r[1] for r in c.execute("PRAGMA table_info(usage)").fetchall()]
+        if "who" not in cols:
+            c.execute("ALTER TABLE usage ADD COLUMN who TEXT")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_usage_who ON usage(who)")
         c.execute("""CREATE TABLE IF NOT EXISTS cache(
                          qhash TEXT PRIMARY KEY,
                          answer TEXT NOT NULL,
@@ -73,25 +79,28 @@ def cache_put(question: str, answer: str):
         pass
 
 
-def check(ip, daily_ip: int = 30, daily_global: int = 300,
+def check(who=None, ip=None, daily_quota: int = 30, daily_global: int = 300,
           min_interval: float = 2.0) -> dict:
     """判断这次提问是否放行（不写记录，放行后要再调 consume）
 
-    返回 {"ok": bool, "reason": str, "ip_left": int|None,
-          "global_left": int, "retry_after": int}
+    计数主体：有 who（从访问链接识别到的人）就按人算，否则退回按 IP 算。
+    返回 {"ok", "reason", "who_left", "global_left", "retry_after"}
     """
     now = time.time()
     since = now - WINDOW
+    subject = who or ip          # 本次的计数主体
     with _LOCK, _conn() as c:
         c.execute("DELETE FROM usage WHERE ts < ?", (since,))      # 顺手清理过期记录
         g = c.execute("SELECT COUNT(*) FROM usage WHERE ts>=?", (since,)).fetchone()[0]
         n = last = None
-        if ip:
-            n = c.execute("SELECT COUNT(*) FROM usage WHERE ts>=? AND ip=?",
-                          (since, ip)).fetchone()[0]
-            last = c.execute("SELECT MAX(ts) FROM usage WHERE ip=?", (ip,)).fetchone()[0]
+        if subject:
+            col = "who" if who else "ip"
+            n = c.execute(f"SELECT COUNT(*) FROM usage WHERE ts>=? AND {col}=?",
+                          (since, subject)).fetchone()[0]
+            last = c.execute(f"SELECT MAX(ts) FROM usage WHERE {col}=?",
+                             (subject,)).fetchone()[0]
 
-    res = {"ok": True, "reason": "", "ip_left": None,
+    res = {"ok": True, "reason": "", "who_left": None,
            "global_left": max(0, daily_global - g), "retry_after": 0}
 
     # ① 全站总配额（最终熔断，保护钱包）
@@ -100,38 +109,44 @@ def check(ip, daily_ip: int = 30, daily_global: int = 300,
                    reason=f"今日全站调用额度已用完（{daily_global} 次），请明天再试。")
         return res
 
-    if ip:
+    if subject:
         # ③ 最小间隔（脚本连发会撞这一条，正常人手速不会）
         if last and now - last < min_interval:
             wait = int(min_interval - (now - last)) + 1
             res.update(ok=False, retry_after=wait,
                        reason=f"提问太快了，请等 {wait} 秒再问。")
             return res
-        # ② 单 IP 配额
-        res["ip_left"] = max(0, daily_ip - n)
-        if n >= daily_ip:
+        # ② 单主体配额
+        res["who_left"] = max(0, daily_quota - n)
+        if n >= daily_quota:
             res.update(ok=False,
-                       reason=f"你今天的提问次数已用完（{daily_ip} 次），请明天再试。")
+                       reason=f"你今天的提问次数已用完（{daily_quota} 次），请明天再试。")
             return res
 
     return res
 
 
-def consume(ip):
+def consume(who=None, ip=None):
     """放行后记一笔（只记成功发出去的请求，被拦的不计入）"""
     try:
         with _LOCK, _conn() as c:
-            c.execute("INSERT INTO usage(ts, ip) VALUES(?,?)", (time.time(), ip or "unknown"))
+            c.execute("INSERT INTO usage(ts, ip, who) VALUES(?,?,?)",
+                      (time.time(), ip, who))
     except Exception:
         pass
 
 
-def stats(daily_ip: int = 30, daily_global: int = 300) -> dict:
-    """给侧边栏显示用：今天全站用了多少、这个 IP 用了多少"""
+def stats(who=None, daily_quota: int = 30, daily_global: int = 300) -> dict:
+    """给侧边栏显示用：今天全站用了多少、这个人用了多少"""
     since = time.time() - WINDOW
+    g = n = 0
     try:
         with _LOCK, _conn() as c:
             g = c.execute("SELECT COUNT(*) FROM usage WHERE ts>=?", (since,)).fetchone()[0]
+            if who:
+                n = c.execute("SELECT COUNT(*) FROM usage WHERE ts>=? AND who=?",
+                              (since, who)).fetchone()[0]
     except Exception:
-        g = 0
-    return {"global_used": g, "global_left": max(0, daily_global - g)}
+        pass
+    return {"global_used": g, "global_left": max(0, daily_global - g),
+            "who_used": n, "who_left": max(0, daily_quota - n) if who else None}

@@ -20,6 +20,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 import guard
+import auth
 from categories import classify, label_of, CATEGORIES, OTHER_KEY, AUTO_PREFIX
 from indexing import KB, index_docs
 from retrieval import hybrid_search
@@ -53,17 +54,24 @@ st.set_page_config(page_title="悍高知识库问答", page_icon="🏢", layout=
 st.title("🏢 悍高知识库问答")
 st.caption("基于资料的 RAG 问答 · 答案只来自手册原文")
 
-# ---------- 访问控制 ----------
-# 在 Secrets / .env 里配了 ACCESS_PASSWORD 才启用登录门。
-# 没配就不拦（避免把自己锁在门外），侧边栏会提示"公开访问"。
-ACCESS_PASSWORD = get_key("ACCESS_PASSWORD")
+# ---------- 访问控制：链接邀请码（点开即进，不用输密码） ----------
+# Secrets 里配 ACCESS_KEYS（一行一个人）：
+#     ACCESS_KEYS = '''
+#     张三=7fK2pQ9xLm
+#     李四=m3R8sT1vBn
+#     '''
+# 访问链接：https://你的地址/?k=7fK2pQ9xLm
+# 删掉对应那行 = 吊销该人的访问权。没配 ACCESS_KEYS 就是公开访问。
+ACCESS_PASSWORD = get_key("ACCESS_PASSWORD")     # 可选后备，配了才显示密码框
+ACCESS_KEYS_RAW = get_key("ACCESS_KEYS")
+KNOWN_KEYS = auth.parse_keys(ACCESS_KEYS_RAW)
 MAX_QUERIES = int(get_key("MAX_QUERIES") or 60)
 
 # ---------- 防刷配额（三层，服务端计数，刷新页面绕不过） ----------
 # 配在 Secrets / .env 里可覆盖；不配用默认值。
 DAILY_GLOBAL_LIMIT = int(get_key("DAILY_GLOBAL_LIMIT") or 300)   # 全站每天总次数（熔断线）
-DAILY_IP_LIMIT = int(get_key("DAILY_IP_LIMIT") or 30)            # 单 IP 每天次数
-MIN_INTERVAL_SEC = float(get_key("MIN_INTERVAL_SEC") or 2)       # 单 IP 最小提问间隔（秒）
+DAILY_QUOTA = int(get_key("DAILY_QUOTA") or 30)                  # 每人（或每 IP）每天次数
+MIN_INTERVAL_SEC = float(get_key("MIN_INTERVAL_SEC") or 2)       # 同一主体最小提问间隔（秒）
 MAX_Q_CHARS = int(get_key("MAX_Q_CHARS") or 300)                 # 单条问题最长字数
 guard.init()
 
@@ -71,7 +79,7 @@ guard.init()
 def client_ip():
     """取访问者 IP：云端由反向代理放在 X-Forwarded-For 里
 
-    本地开发没有这个头 -> 返回 None，此时只走"全站总配额"，
+    本地开发没有这个头 -> 返回 None，此时只按"人"计数、不做 IP 维度限制，
     不会因为所有人共用 'unknown' 而被误伤。
     """
     try:
@@ -85,20 +93,51 @@ def client_ip():
     return None
 
 
-CLIENT_IP = client_ip()
-
-if ACCESS_PASSWORD and not st.session_state.get("authed"):
-    st.info("🔒 这是内部知识库，需要访问密码。")
+def password_fallback():
+    """可选的密码入口（只有配了 ACCESS_PASSWORD 才出现）"""
     _pw = st.text_input("访问密码", type="password", label_visibility="collapsed",
                         placeholder="请输入访问密码")
     if st.button("进入", type="primary"):
         if _pw == ACCESS_PASSWORD:
-            st.session_state["authed"] = True
+            st.session_state["who"] = "密码用户"
             st.rerun()
-        else:
-            st.error("密码不正确")
-    # 未通过验证不继续执行：连建库都不会触发，避免未授权访问消耗 API 额度
-    st.stop()
+        st.error("密码不正确")
+
+
+def resolve_visitor():
+    """确定当前访问者是谁；未配置任何门禁时返回 None（公开访问）
+
+    邀请码校验一次后存进 session_state，后续 rerun 不再查 URL。
+    """
+    who = st.session_state.get("who")
+    if who:
+        return who
+
+    try:
+        k = st.query_params.get("k")            # 链接里的访问码
+    except Exception:
+        k = None
+    who = auth.resolve(k, ACCESS_KEYS_RAW)
+    if who:
+        st.session_state["who"] = who
+        return who
+
+    if KNOWN_KEYS:                              # 配了邀请码机制：不弹密码框，只提示
+        st.info("🔒 这是内部知识库，请用部门发给你的**访问链接**打开（链接里带访问码）。")
+        if ACCESS_PASSWORD:
+            password_fallback()
+        st.stop()
+
+    if ACCESS_PASSWORD:                         # 只配了密码（旧方式，兼容保留）
+        st.info("🔒 这是内部知识库，需要访问密码。")
+        password_fallback()
+        st.stop()
+
+    return None                                 # 什么都没配 -> 公开访问
+
+
+CLIENT_IP = client_ip()
+WHO = resolve_visitor()
 
 # ---------- 初始化模型与向量库（缓存，只在首次运行时执行） ----------
 from openai import OpenAI
@@ -324,10 +363,16 @@ with st.sidebar:
         st.caption(f"· {label}：{files} 份资料 / {chunks} 个片段")
 
     st.caption("提示：类别只影响下方推荐提问的方向，搜索始终覆盖全部资料")
-    st.caption("🔒 已启用访问密码" if ACCESS_PASSWORD else "🌐 公开访问（未设密码）")
-    _s = guard.stats(DAILY_IP_LIMIT, DAILY_GLOBAL_LIMIT)
-    st.caption(f"🧮 今日全站剩余额度：{_s['global_left']} / {DAILY_GLOBAL_LIMIT} 次"
-               f"（单 IP 上限 {DAILY_IP_LIMIT} 次/天）")
+    if WHO:
+        st.caption(f"👤 已登录：{WHO}")
+    elif KNOWN_KEYS or ACCESS_PASSWORD:
+        st.caption("🔒 已启用访问控制")
+    else:
+        st.caption("🌐 公开访问（未设门禁）")
+    _s = guard.stats(WHO, DAILY_QUOTA, DAILY_GLOBAL_LIMIT)
+    if WHO:
+        st.caption(f"🧮 你今天还可提问 {_s['who_left']} 次（上限 {DAILY_QUOTA} 次/天）")
+    st.caption(f"全站今日剩余额度：{_s['global_left']} / {DAILY_GLOBAL_LIMIT} 次")
     if st.button("🗑️ 清空对话", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
@@ -456,8 +501,8 @@ if q := (st.chat_input(placeholder) or clicked):
         st.error(f"本次会话提问已达上限（{MAX_QUERIES} 次），请明天再试。")
         st.stop()
 
-    # ③ 服务端三层配额：计数存在 SQLite 里，刷新页面 / 换无痕窗口都绕不过
-    gate = guard.check(CLIENT_IP, DAILY_IP_LIMIT, DAILY_GLOBAL_LIMIT, MIN_INTERVAL_SEC)
+    # ③ 服务端三层配额：按人计数（没有身份时按 IP），刷新页面 / 换无痕都绕不过
+    gate = guard.check(WHO, CLIENT_IP, DAILY_QUOTA, DAILY_GLOBAL_LIMIT, MIN_INTERVAL_SEC)
     if not gate["ok"]:
         st.warning(gate["reason"])
         st.stop()
@@ -474,7 +519,7 @@ if q := (st.chat_input(placeholder) or clicked):
             st.caption("⚡ 命中缓存，本次未调用模型")
             answer = cached
         else:
-            guard.consume(CLIENT_IP)               # 只有真要发请求才记一次配额
+            guard.consume(WHO, CLIENT_IP)          # 只有真要发请求才记一次配额
             answer = st.write_stream(ask(q))
         rq = st.session_state.get("last_query")
         if rq and rq != q:
