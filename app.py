@@ -15,6 +15,7 @@
 --------------------------------------------------------------------
 """
 import os
+import random
 import uuid
 import chromadb
 import streamlit as st
@@ -342,23 +343,27 @@ with st.sidebar:
 
 
 # ---------- 推荐提问：按所选类别的真实内容现场生成（生成一次后缓存复用） ----------
-@st.cache_data(show_spinner="正在根据该类资料生成推荐问题……")
-def suggest_questions(collection: str, category, n_docs: int) -> list:
-    """从库里抽几段原文，让 DeepSeek 猜'用户最可能问什么'
+@st.cache_data(show_spinner="正在根据该类资料生成推荐问题……", max_entries=32)
+def suggest_questions(collection: str, category, n_docs: int, seed: int = 0) -> list:
+    """从库里随机抽几段原文，让 DeepSeek 猜'用户最可能问什么'
 
     category 有值时只从这个大类的片段里抽样 -> 推荐问题围绕该业务方向；
     抽样范围与检索范围互不影响。
+    seed 是"换一批"的轮次号：每点一次按钮 +1，抽样和缓存都跟着换，
+    同一批内仍然复用缓存，不重复花钱。
     """
     try:
-        kw = {"limit": 6}
+        kw = {"limit": 40}                               # 抽样池比单批大，才有得换
         if category:                                     # 只从所选类别抽原文
             kw["where"] = {"category": category}
         docs_ = db.get_collection(collection).get(**kw)["documents"]
-        if not docs_:                                    # 该类别没数据 -> 退回全库
-            docs_ = db.get_collection(collection).get(limit=6)["documents"]
+        if not docs_ and category:                       # 该类别没数据 -> 退回全库
+            docs_ = db.get_collection(collection).get(limit=40)["documents"]
         if not docs_:
             return []
-        sample = "\n".join(d[:150] for d in docs_)
+        rnd = random.Random(seed)                        # seed 变 -> 换一批不同片段
+        pick = rnd.sample(docs_, min(6, len(docs_)))
+        sample = "\n".join(d[:150] for d in pick)
         scope = label_of(category) if category else "公司全部资料"
         res = llm.chat.completions.create(
             model="deepseek-chat",
@@ -439,12 +444,17 @@ clicked = None
 if st.session_state.get("related"):
     clicked = render_related()
 else:
-    sugs = suggest_questions(KB, CATEGORY, col.count())
+    seed = st.session_state.get("sug_seed", 0)           # "换一批"轮次号
+    sugs = suggest_questions(KB, CATEGORY, col.count(), seed)
     if sugs:
-        st.caption(f"💡 可以这样问（{picked}）：" if CATEGORY else "💡 可以这样问：")
+        head, refresh = st.columns([5, 1])
+        head.caption(f"💡 可以这样问（{picked}）：" if CATEGORY else "💡 可以这样问：")
+        if refresh.button("🔄 换一批", use_container_width=True):
+            st.session_state["sug_seed"] = seed + 1      # 下一次运行换一批
+            st.rerun()
         row = st.columns(len(sugs))
         for box, question in zip(row, sugs):
-            if box.button(question, key=f"sug_{picked}_{question}"):
+            if box.button(question, key=f"sug_{seed}_{picked}_{question}"):
                 clicked = question
 
 placeholder = (f"想了解{picked}的哪些规定？" if CATEGORY
