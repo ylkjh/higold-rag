@@ -15,12 +15,12 @@
 --------------------------------------------------------------------
 """
 import os
+import uuid
 import chromadb
 import streamlit as st
 from dotenv import load_dotenv
 
 import guard
-import auth
 from categories import classify, label_of, CATEGORIES, OTHER_KEY, AUTO_PREFIX
 from indexing import KB, index_docs
 from retrieval import hybrid_search
@@ -54,76 +54,11 @@ st.set_page_config(page_title="悍高知识库问答", page_icon="🏢", layout=
 st.title("🏢 悍高知识库问答")
 st.caption("基于资料的 RAG 问答 · 答案只来自手册原文")
 
-# ---------- 访问控制：公司账号登录（OIDC）+ 邮箱白名单 ----------
-# 用户在 Secrets 里配好 [auth] 段（client_id / client_secret / server_metadata_url
-# / redirect_uri / cookie_secret），应用就会要求"用公司账号登录"。
-# 登录后校验邮箱是否在 ALLOWED_EMAILS 里：
-#     ALLOWED_EMAILS = "zhangsan@higold.com.cn, @higold.com.cn"
-# 没配 [auth] 时应用不拦人（本地开发方便）；配了才生效。
-ALLOWED_EMAILS = get_key("ALLOWED_EMAILS")
-ACCESS_KEYS_RAW = get_key("ACCESS_KEYS")          # 备用方式（链接邀请码），配了才生效
-KNOWN_KEYS = auth.parse_keys(ACCESS_KEYS_RAW)
-MAX_QUERIES = int(get_key("MAX_QUERIES") or 60)
-
-
-def oidc_ready() -> bool:
-    """Secrets 里的 [auth] 段是否配齐（缺任何一项都视为未配置）"""
-    try:
-        cfg = st.secrets["auth"]
-        return all(cfg.get(k) for k in
-                   ("client_id", "client_secret", "server_metadata_url", "redirect_uri"))
-    except Exception:
-        return False
-
-
-def user_field(name, default=None):
-    """安全读取 st.user 的字段（未登录时属性可能不存在）"""
-    try:
-        return getattr(st.user, name)
-    except Exception:
-        try:
-            return st.user.get(name, default)
-        except Exception:
-            return default
-
-
-def resolve_visitor():
-    """确定当前访问者是谁；未配置任何门禁时返回 None（公开访问）
-
-    主路径：公司账号登录 -> 返回邮箱（后续配额也按邮箱算）。
-    备用：链接邀请码（?k=xxx），仅在 OIDC 未配置且配了 ACCESS_KEYS 时生效。
-    """
-    if oidc_ready():
-        if not user_field("is_logged_in"):
-            st.info("🔒 这是内部知识库，请用公司账号登录后使用。")
-            st.button("使用公司账号登录", type="primary", on_click=st.login)
-            st.stop()
-
-        email = (user_field("email") or "").strip().lower()
-        if not auth.email_allowed(email, ALLOWED_EMAILS):
-            st.error(f"账号 {email or '（未取到邮箱）'} 不在授权名单内。"
-                     "如需开通，请联系管理员把你加入白名单。")
-            st.button("换一个账号登录", on_click=st.logout)
-            st.stop()
-        return email
-
-    # 备用：链接邀请码
-    who = st.session_state.get("who")
-    if who:
-        return who
-    try:
-        k = st.query_params.get("k")
-    except Exception:
-        k = None
-    who = auth.resolve(k, ACCESS_KEYS_RAW)
-    if who:
-        st.session_state["who"] = who
-        return who
-    if KNOWN_KEYS:
-        st.info("🔒 这是内部知识库，请用部门发给你的访问链接打开。")
-        st.stop()
-
-    return None                                 # 什么都没配 -> 公开访问（本地开发）
+# ---------- 访问控制：不设登录门，靠"每个 IP 每日配额"防刷 ----------
+# 设计取舍：不做账号登录、不发密码、不发链接，谁有网址都能打开，
+# 但同一个 IP 每天只能问 DAILY_QUOTA 次，全站每天有总量上限（熔断）。
+# 代价是"挡不住换 IP 的人"，好处是零门槛、零维护。
+MAX_QUERIES = int(get_key("MAX_QUERIES") or 60)                  # 单会话软上限
 
 
 # ---------- 防刷配额（三层，服务端计数，刷新页面绕不过） ----------
@@ -153,7 +88,24 @@ def client_ip():
 
 
 CLIENT_IP = client_ip()
-WHO = resolve_visitor()
+
+
+def visitor_id() -> str:
+    """配额计数用的身份：优先真实 IP
+
+    云端取不到 X-Forwarded-For 时退回"会话随机串"，至少能挡住
+    单个会话内的连发；配合全站总配额，最坏情况也有上限。
+    """
+    if CLIENT_IP:
+        return f"ip:{CLIENT_IP}"
+    sid = st.session_state.get("sid")
+    if not sid:
+        sid = uuid.uuid4().hex[:12]
+        st.session_state["sid"] = sid
+    return f"session:{sid}"
+
+
+WHO = visitor_id()          # 这里不是"谁登录了"，而是"配额算在谁头上"
 
 
 # ---------- 初始化模型与向量库（缓存，只在首次运行时执行） ----------
@@ -380,21 +332,13 @@ with st.sidebar:
         st.caption(f"· {label}：{files} 份资料 / {chunks} 个片段")
 
     st.caption("提示：类别只影响下方推荐提问的方向，搜索始终覆盖全部资料")
-    if WHO:
-        st.caption(f"👤 已登录：{WHO}")
-    elif oidc_ready() or KNOWN_KEYS:
-        st.caption("🔒 已启用访问控制")
-    else:
-        st.caption("🌐 公开访问（未设门禁）")
     _s = guard.stats(WHO, DAILY_QUOTA, DAILY_GLOBAL_LIMIT)
-    if WHO:
-        st.caption(f"🧮 你今天还可提问 {_s['who_left']} 次（上限 {DAILY_QUOTA} 次/天）")
+    st.caption(f"🌐 公开访问 · 每个 IP 每天 {DAILY_QUOTA} 次")
+    st.caption(f"🧮 你今天还可提问 {_s['who_left']} 次")
     st.caption(f"全站今日剩余额度：{_s['global_left']} / {DAILY_GLOBAL_LIMIT} 次")
     if st.button("🗑️ 清空对话", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
-    if WHO and oidc_ready():
-        st.button("退出登录", use_container_width=True, on_click=st.logout)
 
 
 # ---------- 推荐提问：按所选类别的真实内容现场生成（生成一次后缓存复用） ----------
