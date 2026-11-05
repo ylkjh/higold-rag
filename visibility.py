@@ -89,3 +89,24 @@ def why_sensitive(text: str) -> str:
         if FIN_DATA.search(sentence):
             return "经营数据：" + sentence.strip()[:28]
     return ""
+
+
+# ---------- 6. 导出脱敏：人名不整块删，就地打码 ----------
+# 制度文件页首页尾都有"制定/日期:张三  审核/日期:李四"这类签署栏。
+# 人名不在正则的能力范围内（重名、姓氏组合太多），但整块删又会连带丢掉正文，
+# 所以在导出阶段做定点替换：保留版面结构，只把人名换成 ×。
+SIGN_NAME = re.compile(
+    r"((?:制定|编制|审核|批准|核准|审定)\s*/\s*日期\s*[:：])"
+    r"([ \t\u3000]*)"                       # 只吃同一行的空白，不能跨行
+    r"([\u4e00-\u9fff]{2,4})"
+    r"(?!\s*/\s*日期)"                      # 后面跟着"/日期"说明是下一个签署栏，不是人名
+)
+SIGN_NAME_2 = re.compile(
+    r"((?:制定人|编制人|审核人|批准人)\s*[:：])([ \t\u3000]*)([\u4e00-\u9fff]{2,4})")
+
+
+def mask_public(text: str) -> str:
+    """导出前的定点脱敏：签署栏人名 -> ×××"""
+    text = SIGN_NAME.sub(r"\1\2×××", text)
+    text = SIGN_NAME_2.sub(r"\1\2×××", text)
+    return text

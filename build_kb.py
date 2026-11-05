@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
-"""悍高知识库建库脚本：docs/ 里所有 PDF -> 分级 -> 切块 -> 向量化 -> 存入 Chroma
+"""悍高知识库建库脚本：docs/ 里所有 PDF -> 分级 -> 切父子块 -> 向量化 -> 存入 Chroma
 --------------------------------------------------------------------------
 一次运行做三件事：
 
-  1. 建本地全量库（higold_kb）
-     每块数据带三个标签：
+  1. 建本地全量库（父子块结构，见 indexing.py）
+       子块 300 字：建向量索引 + BM25 索引，负责"检索得准"
+       父块 1200 字：命中后交给大模型，负责"上下文完整"
+     每块数据带四个标签：
        source     来源文件名
        category   内容大类（人事与考勤 / 行政与后勤 / 财务与内控 ……）
+       parent_id  所属父块（small-to-big 回填用）
        visibility public（可公开）/ internal（含实际数据，不可外传）
 
-  2. 按内容自动分级（规则见 visibility.py）
+  2. 按内容自动分级（规则见 visibility.py），粒度是**子块**（300 字）
      制度、流程、规定、职责、审批权限  -> public（可公开）
      报价、单价、客户/供应商名单、联系人、工资表、真实经营数据 -> internal
 
@@ -32,36 +35,28 @@ import shutil
 
 from dotenv import load_dotenv
 from pypdf import PdfReader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from openai import OpenAI
 import chromadb
 
 from categories import classify, label_of
-from visibility import is_public_block, why_sensitive
+from visibility import is_public_block, why_sensitive, mask_public
+from indexing import index_docs, split_parent_child, KB
 
 BASE = os.path.dirname(__file__)
 load_dotenv(os.path.join(BASE, ".env"))
 
 # ---------- 人工干预名单（填文件名，不含 .pdf 后缀） ----------
-# 整份不公开：这类文件是公司受控文件，或确认含大量实际数据
-FORCE_INTERNAL = {"悍高集团内部控制管理手册"}
-# 整份强制公开：确认无敏感内容的对外宣传资料
+FORCE_INTERNAL = {"悍高集团内部控制管理手册"}   # 受控文件，整份不上云端
 FORCE_PUBLIC = set()
 
 client = OpenAI(api_key=os.getenv("SILICONFLOW_API_KEY"),
                 base_url="https://api.siliconflow.cn/v1")
 db = chromadb.PersistentClient(path=os.path.join(BASE, "db"))
-
-KB = "higold_kb"
-PUB_DIR = os.path.join(BASE, "docs", "public")     # 公开版导出目录
-
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500, chunk_overlap=50,
-    separators=["\n\n", "\n", "。", "，", " "])
+PUB_DIR = os.path.join(BASE, "docs", "public")
 
 
 def merge_chunks(chunks: list) -> str:
-    """把相邻切块拼回连续文本，同时去掉块间重叠的 50 字，避免重复内容"""
+    """把相邻子块拼回连续文本，同时去掉块间重叠，避免重复内容"""
     out = []
     for c in chunks:
         if out:
@@ -74,68 +69,72 @@ def merge_chunks(chunks: list) -> str:
     return "\n".join(out)
 
 
-def rebuild(pdf_names: list) -> None:
-    try:
-        db.delete_collection(KB)
-    except Exception:
-        pass
-    col = db.get_or_create_collection(KB)
-
+def rebuild(pdf_names: list, do_index: bool = True) -> None:
     # 清空旧的公开版导出，防止已删除的资料残留
     if os.path.isdir(PUB_DIR):
         shutil.rmtree(PUB_DIR)
     os.makedirs(PUB_DIR, exist_ok=True)
 
-    total = 0
-    stat = {}          # 类别 -> 份数
-    print("\n========== 内容分级报告 ==========")
+    items, stat, report = [], {}, []
+    print("\n========== 内容分级报告（按 300 字子块判定）==========")
     for name in pdf_names:
         stem = name.rsplit(".", 1)[0]
         text = "\n".join(p.extract_text() or "" for p in
                          PdfReader(os.path.join(BASE, "docs", name)).pages)
+        if not text.strip():
+            print(f"{name:<34} 无文字层（可能是扫描件），跳过")
+            continue
         cat = classify(name, text)
-        chunks = splitter.split_text(text)
+        pairs = split_parent_child(text)
+        all_kids = [k for _p, kids in pairs for k in kids]
 
-        # ---------- 分级：哪些块可以公开 ----------
+        # ---------- 分级 ----------
         if stem in FORCE_INTERNAL:
-            flags, note = [False] * len(chunks), "整份锁定为内部"
+            flags, note = [False] * len(all_kids), "整份锁定为内部"
         elif stem in FORCE_PUBLIC:
-            flags, note = [True] * len(chunks), "整份强制公开"
+            flags, note = [True] * len(all_kids), "整份强制公开"
         else:
-            flags = [is_public_block(c) for c in chunks]
+            flags = [is_public_block(c) for c in all_kids]
             note = "按内容自动分级"
 
-        pub_chunks = [c for c, ok in zip(chunks, flags) if ok]
-        n_pub = len(pub_chunks)
-        print(f"{name:<34} {len(chunks):>4} 块 -> 公开 {n_pub:>3} / 内部 {len(chunks) - n_pub:>3}  [{note}]")
-        # 打印 1 条内部块的原因，方便人工复核判定是否合理
-        for c, ok in zip(chunks, flags):
+        pub_kids = [c for c, ok in zip(all_kids, flags) if ok]
+        n_pub = len(pub_kids)
+        print(f"{name:<34} {len(all_kids):>4} 子块 -> 公开 {n_pub:>3} / 内部 {len(all_kids) - n_pub:>3}  "
+              f"（{len(pairs)} 父块）[{note}]")
+        for c, ok in zip(all_kids, flags):
             if not ok:
-                print(f"      例：{why_sensitive(c)}")
+                reason = why_sensitive(c)
+                if reason:
+                    print(f"      例：{reason}")
                 break
 
-        # ---------- 入库（本地全量，含内部块，供本机查询） ----------
-        for i in range(0, len(chunks), 32):
-            batch = chunks[i:i + 32]
-            res = client.embeddings.create(model="BAAI/bge-m3", input=batch)
-            col.add(ids=[f"kb_{total + j}" for j in range(len(batch))],
-                    documents=batch,
-                    embeddings=[d.embedding for d in res.data],
-                    metadatas=[{"source": stem, "category": cat,
-                                "visibility": "public" if flags[i + j] else "internal"}
-                               for j in range(len(batch))])
-            total += len(batch)
+        # 该文件的公开判定函数（供入库时逐子块打 visibility 标签）
+        if stem in FORCE_INTERNAL:
+            vis = lambda _c: "internal"
+        elif stem in FORCE_PUBLIC:
+            vis = lambda _c: "public"
+        else:
+            vis = lambda c: "public" if is_public_block(c) else "internal"
+
+        items.append((stem, cat, text, vis))
 
         # ---------- 导出公开版（只有这部分会上 GitHub） ----------
-        if pub_chunks:
+        # 导出前做定点脱敏：签署栏里的员工姓名 -> ×××（版面保留，内容不丢）
+        if pub_kids:
             with open(os.path.join(PUB_DIR, f"{stem}.txt"), "w", encoding="utf-8") as f:
-                f.write(merge_chunks(pub_chunks))
+                f.write(mask_public(merge_chunks(pub_kids)))
         else:
-            print(f"      注意：整份无公开内容，不导出公开版")
+            print("      注意：整份无公开内容，不导出公开版")
 
         stat[cat] = stat.get(cat, 0) + 1
 
-    print(f"\n本地库共 {total} 条记录")
+    print("\n========== 向量化入库 ==========")
+    if do_index:
+        res = index_docs(db, items, client, log=lambda s: print(s, flush=True))
+        print(f"\n本地库：{res['children']} 个子块（建索引）/ {res['parents']} 个父块（喂上下文）")
+        print("BM25 索引在查询时由子块文本现建，无需额外存储")
+    else:
+        print("（--export-only）跳过向量化入库，只更新 docs/public/")
     print("类别汇总：")
     for cat, n in stat.items():
         print(f"  {label_of(cat):<10} {n} 份资料")
@@ -148,9 +147,9 @@ pdfs = sorted(f for f in os.listdir(docs_dir) if f.lower().endswith(".pdf"))
 if not pdfs:
     raise SystemExit("docs/ 里没有 PDF，请先放入资料")
 
-rebuild(pdfs)
+rebuild(pdfs, do_index="--export-only" not in __import__("sys").argv)
 
-# 清理旧版双库（早期方案遗留）
+# 清理旧版遗留集合
 for legacy in ("higold_public", "higold_internal"):
     try:
         db.delete_collection(legacy)

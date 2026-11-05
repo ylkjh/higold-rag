@@ -20,6 +20,8 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from categories import classify, label_of, CATEGORIES, OTHER_KEY, AUTO_PREFIX
+from indexing import KB, index_docs
+from retrieval import hybrid_search
 
 BASE = os.path.dirname(__file__)
 
@@ -50,6 +52,25 @@ st.set_page_config(page_title="悍高知识库问答", page_icon="🏢", layout=
 st.title("🏢 悍高知识库问答")
 st.caption("基于资料的 RAG 问答 · 答案只来自手册原文")
 
+# ---------- 访问控制 ----------
+# 在 Secrets / .env 里配了 ACCESS_PASSWORD 才启用登录门。
+# 没配就不拦（避免把自己锁在门外），侧边栏会提示"公开访问"。
+ACCESS_PASSWORD = get_key("ACCESS_PASSWORD")
+MAX_QUERIES = int(get_key("MAX_QUERIES") or 60)
+
+if ACCESS_PASSWORD and not st.session_state.get("authed"):
+    st.info("🔒 这是内部知识库，需要访问密码。")
+    _pw = st.text_input("访问密码", type="password", label_visibility="collapsed",
+                        placeholder="请输入访问密码")
+    if st.button("进入", type="primary"):
+        if _pw == ACCESS_PASSWORD:
+            st.session_state["authed"] = True
+            st.rerun()
+        else:
+            st.error("密码不正确")
+    # 未通过验证不继续执行：连建库都不会触发，避免未授权访问消耗 API 额度
+    st.stop()
+
 # ---------- 初始化模型与向量库（缓存，只在首次运行时执行） ----------
 from openai import OpenAI
 from langsmith import traceable
@@ -67,12 +88,10 @@ def load_components():
 
 embed_client, llm, db = load_components()
 
-KB = "higold_kb"   # 唯一知识库
-
 
 # ---------- 首次启动：自动建库（云端 db 为空时现场重建，只读手边有的资料） ----------
 def kb_ready() -> bool:
-    """库里已有数据、且数据带类别和公开级别标签 -> 不用重建"""
+    """库里已有数据、且带父子块与公开级别标签 -> 不用重建"""
     if KB not in {c.name for c in db.list_collections()}:
         return False
     col_tmp = db.get_collection(KB)
@@ -82,7 +101,8 @@ def kb_ready() -> bool:
     if not metas:
         return False
     meta = metas[0] or {}
-    return "category" in meta and "visibility" in meta
+    # parent 是父子块方案新增的，缺它就说明是旧版数据，必须重建
+    return all(k in meta for k in ("category", "visibility", "parent"))
 
 
 def load_docs() -> list:
@@ -117,30 +137,16 @@ def load_docs() -> list:
 def ensure_kb():
     if kb_ready():
         return
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-    try:
-        db.delete_collection(KB)          # 旧版本数据没有类别标签，删掉重建
-    except Exception:
-        pass
+    from langchain_text_splitters import RecursiveCharacterTextSplitter  # noqa: F401
     docs = load_docs()
     if not docs:
         st.error("没有找到任何资料：本地需要 docs/*.pdf，云端需要 docs/public/*.txt")
         return
-    col_new = db.get_or_create_collection(KB)
-    total = 0
-    for stem, cat, text in docs:
-        chunks = RecursiveCharacterTextSplitter(
-            chunk_size=500, chunk_overlap=50).split_text(text)
-        for i in range(0, len(chunks), 16):
-            batch = chunks[i:i + 16]
-            res = embed_client.embeddings.create(model="BAAI/bge-m3", input=batch)
-            col_new.add(ids=[f"kb_{total + j}" for j in range(len(batch))],
-                        documents=batch,
-                        embeddings=[d.embedding for d in res.data],
-                        metadatas=[{"source": stem, "category": cat,
-                                    "visibility": "public"}] * len(batch))
-            total += len(batch)
-        print(f"[自动建库] {stem} -> {label_of(cat)}: {len(chunks)} 块")
+    with st.spinner("首次启动，正在建知识库（切块 + 向量化），约 20 秒……"):
+        res = index_docs(db, [(s, c, t, (lambda _c: "public")) for s, c, t in docs],
+                         embed_client, log=lambda s: print(s, flush=True))
+    print(f"[建库完成] {res['children']} 子块 / {res['parents']} 父块")
+
 
 ensure_kb()
 col = db.get_collection(KB)
@@ -191,33 +197,79 @@ SYSTEM_PROMPT = (
 )
 
 
-def retrieve(question: str, k: int = 5) -> str:
-    """检索：问题变向量 -> Chroma 全库找最相关的 k 块原文
+def retrieve(question: str, k: int = 4):
+    """混合检索（向量 + BM25 + RRF + rerank）-> 父块上下文
 
-    每段前面带上《来源资料名》，让模型能标注依据、也能据此提相关问题。
-    注意：检索始终覆盖全部资料，不受侧边栏所选类别限制。
+    返回 (context, hits)。hits 用于在回答下方展示检索来源。
+    检索始终覆盖全部资料，不受侧边栏所选类别限制。
     """
-    vec = embed_client.embeddings.create(model="BAAI/bge-m3", input=[question])
-    res = col.query(query_embeddings=vec.data[0].embedding, n_results=k,
-                    include=["documents", "metadatas"])
-    blocks = []
-    for doc, meta in zip(res["documents"][0], res["metadatas"][0]):
-        blocks.append(f"《{meta.get('source', '手册资料')}》\n{doc}")
-    return "\n----\n".join(blocks)
+    try:
+        out = hybrid_search(db, question, embed_client, SILICONFLOW_KEY, k=k)
+        return out["context"], out["hits"]
+    except Exception as e:                      # 混合检索异常时降级为纯向量
+        print(f"[检索降级] {e}")
+        vec = embed_client.embeddings.create(model="BAAI/bge-m3", input=[question])
+        res = col.query(query_embeddings=vec.data[0].embedding, n_results=k,
+                        include=["documents", "metadatas"])
+        blocks, hits = [], []
+        for doc, meta in zip(res["documents"][0], res["metadatas"][0]):
+            blocks.append(f"《{meta.get('source', '手册资料')}》\n{doc}")
+            hits.append({"source": meta.get("source", ""), "child": doc})
+        return "\n----\n".join(blocks), hits
+
+
+def condense_question(question: str, history: list) -> str:
+    """多轮对话第一步：把"那第二条呢"这类指代补全成可独立检索的问题
+
+    聊天界面最容易踩的坑：用户追问"那这个呢"，原句里没有任何实体，
+    直接拿去检索必然跑偏。这里用一次轻量 LLM 调用，把历史上下文压进当前问题。
+    改写失败（网络/接口异常）就退回原问题，不影响主流程。
+    """
+    if not history:
+        return question
+    recent = history[-6:]                       # 最近 3 轮
+    convo = "\n".join(
+        f"{'用户' if m['role'] == 'user' else '助手'}：{m['content'][:200]}"
+        for m in recent)
+    try:
+        r = llm.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system",
+                 "content": "把用户最新的提问改写成一个不依赖对话上下文、可以独立检索的"
+                            "完整问题。只输出改写后的问题本身，不要解释、不要加引号。"
+                            "如果最新提问本身已经完整，就原样输出。"},
+                {"role": "user", "content": f"对话历史：\n{convo}\n\n最新提问：{question}"},
+            ])
+        out = (r.choices[0].message.content or "").strip()
+        return out or question
+    except Exception:
+        return question
 
 
 # @traceable：每次问答在 LangSmith 生成一条完整追踪记录
 # （调用树：检索 -> 拼 Prompt -> LLM，网页上层层展开查看）
 @traceable
 def ask(question: str):
-    """完整 RAG：检索 -> 拼 Prompt -> DeepSeek 流式回答"""
-    context = retrieve(question)
+    """完整 RAG：问题改写 -> 检索 -> 拼 Prompt（含历史）-> DeepSeek 流式回答"""
+    history = st.session_state.messages[:-1]          # 不含刚追加的当前问题
+    search_q = condense_question(question, history)
+    if search_q != question:
+        st.session_state["last_query"] = search_q     # 界面上可核对改写结果
+    else:
+        st.session_state.pop("last_query", None)
+    context, hits = retrieve(search_q)
+    st.session_state["last_hits"] = hits              # 供界面展示来源
+
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT.format(context=context)}]
+    for m in history[-4:]:                            # 带最近 2 轮进生成端
+        if m["content"]:
+            msgs.append({"role": m["role"], "content": m["content"][:800]})
+    msgs.append({"role": "user", "content": question})
+
     stream = llm.chat.completions.create(
         model="deepseek-chat",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT.format(context=context)},
-            {"role": "user", "content": question},
-        ],
+        messages=msgs,
         stream=True,
     )
     for chunk in stream:
@@ -240,6 +292,7 @@ with st.sidebar:
         st.caption(f"· {label}：{files} 份资料 / {chunks} 个片段")
 
     st.caption("提示：类别只影响下方推荐提问的方向，搜索始终覆盖全部资料")
+    st.caption("🔒 已启用访问密码" if ACCESS_PASSWORD else "🌐 公开访问（未设密码）")
     if st.button("🗑️ 清空对话", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
@@ -295,7 +348,7 @@ def related_questions(question: str, n_docs: int) -> list:
     同业务领域、且这些片段确实能回答的问题。生成一次后缓存，不重复花钱。
     """
     try:
-        ctx = retrieve(question)
+        ctx, _hits = retrieve(question)
         res = llm.chat.completions.create(
             model="deepseek-chat",
             messages=[
@@ -351,6 +404,11 @@ placeholder = (f"想了解{picked}的哪些规定？" if CATEGORY
                else "输入问题，例如：宿舍管理有什么规定？")
 
 if q := (st.chat_input(placeholder) or clicked):
+    # 会话提问上限：防止公网被脚本刷爆 API 额度
+    st.session_state["qcount"] = st.session_state.get("qcount", 0) + 1
+    if st.session_state["qcount"] > MAX_QUERIES:
+        st.error(f"本次会话提问已达上限（{MAX_QUERIES} 次），刷新页面可重新开始。")
+        st.stop()
     st.session_state.pop("related", None)          # 已经重新提问，清掉上轮的相关问题
     st.session_state.messages.append({"role": "user", "content": q})
     with st.chat_message("user"):
@@ -358,6 +416,15 @@ if q := (st.chat_input(placeholder) or clicked):
 
     with st.chat_message("assistant"):
         answer = st.write_stream(ask(q))
+        rq = st.session_state.get("last_query")
+        if rq and rq != q:
+            st.caption(f"🔎 追问理解成：{rq}")
+        hits = st.session_state.get("last_hits") or []
+        if hits:
+            srcs = "、".join(dict.fromkeys(f"《{h['source']}》" for h in hits
+                                          if h.get("source")))
+            if srcs:
+                st.caption(f"📚 检索来源：{srcs}（混合检索 + 精排）")
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
     # 手册里没有 -> 生成"相近且手册能回答"的问题，rerun 后显示在回答下方
