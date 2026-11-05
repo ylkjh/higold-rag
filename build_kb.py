@@ -1,17 +1,16 @@
 # -*- coding: utf-8 -*-
-"""悍高知识库建库脚本：PDF -> 切块 -> 向量化 -> 存入 Chroma
+"""悍高知识库建库脚本：docs/ 里所有 PDF -> 切块 -> 向量化 -> 存入 Chroma
 --------------------------------------------------------------------
-两套知识库（权限隔离设计）：
-  higold_public   ：公开版手册 docs/higold_manual.pdf（整理自公开资料，
-                    可随代码上传 GitHub 公开仓库）
-  higold_internal ：公司内部控制管理手册（保密级别：内部！只在本机建库，
-                    绝对不能上传 GitHub / 公网）
-用法：
-  python build_kb.py            # 建两套库
-  python build_kb.py internal   # 只重建内部版（手册更新后跑这个）
+分类规则（安全默认，白名单制）：
+  公开库 higold_public   ：只收录 PUBLIC_FILES 白名单里的 PDF（可上 GitHub/公网）
+  内部库 higold_internal ：docs/ 里其余全部 PDF（仅本机，禁止上传公网）
+
+怎么加新资料：
+  1. 把 PDF 丢进 docs/ 文件夹
+  2. 运行  python build_kb.py     （自动识别、自动归类、整库重建）
+  想把某份资料公开：先确认内容可公开，再把文件名加进 PUBLIC_FILES
 --------------------------------------------------------------------
 """
-import sys
 import os
 from dotenv import load_dotenv
 from pypdf import PdfReader
@@ -22,50 +21,52 @@ import chromadb
 BASE = os.path.dirname(__file__)
 load_dotenv(os.path.join(BASE, ".env"))
 
-client = OpenAI(
-    api_key=os.getenv("SILICONFLOW_API_KEY"),
-    base_url="https://api.siliconflow.cn/v1",
-)
+# ---------- 公开白名单：只有列在这里的文件才会进入公开库（可上公网） ----------
+PUBLIC_FILES = {"higold_manual.pdf"}
+
+client = OpenAI(api_key=os.getenv("SILICONFLOW_API_KEY"),
+                base_url="https://api.siliconflow.cn/v1")
 db = chromadb.PersistentClient(path=os.path.join(BASE, "db"))
 
 
-def build(pdf_path: str, collection_name: str):
-    """通用建库：读 PDF -> 切块 -> 向量化 -> 入库"""
-    text = "\n".join(
-        page.extract_text() or "" for page in PdfReader(pdf_path).pages)
-    print(f"[{collection_name}] 读取完成：{len(text)} 字符")
-
-    chunks = RecursiveCharacterTextSplitter(
-        chunk_size=500, chunk_overlap=50,
-        separators=["\n\n", "\n", "。", "，", " "],
-    ).split_text(text)
-    print(f"[{collection_name}] 切分成 {len(chunks)} 个文本块")
-
+def rebuild(collection_name: str, pdf_names: list) -> int:
+    """整库重建：先删旧库，再把多份 PDF 的切块全部入库（避免逐份建库互相覆盖）"""
     try:
         db.delete_collection(collection_name)
     except Exception:
         pass
     col = db.get_or_create_collection(collection_name)
+    total = 0
+    for name in pdf_names:
+        path = os.path.join(BASE, "docs", name)
+        text = "\n".join(p.extract_text() or "" for p in PdfReader(path).pages)
+        print(f"[{collection_name}] {name}: 读取 {len(text)} 字符")
+        chunks = RecursiveCharacterTextSplitter(
+            chunk_size=500, chunk_overlap=50,
+            separators=["\n\n", "\n", "。", "，", " "]).split_text(text)
+        for i in range(0, len(chunks), 32):
+            batch = chunks[i:i + 32]
+            res = client.embeddings.create(model="BAAI/bge-m3", input=batch)
+            col.add(ids=[f"{collection_name}_{total + j}" for j in range(len(batch))],
+                    documents=batch,
+                    embeddings=[d.embedding for d in res.data])
+            total += len(batch)
+        print(f"[{collection_name}] {name}: {len(chunks)} 块已入库")
+    print(f"[{collection_name}] 完成！共 {total} 条记录\n")
+    return total
 
-    for i in range(0, len(chunks), 32):
-        batch = chunks[i:i + 32]
-        res = client.embeddings.create(model="BAAI/bge-m3", input=batch)
-        col.add(
-            ids=[f"{collection_name}_{i + j}" for j in range(len(batch))],
-            documents=batch,
-            embeddings=[d.embedding for d in res.data],
-        )
-        print(f"  已入库 {min(i + 32, len(chunks))}/{len(chunks)}")
-    print(f"[{collection_name}] 完成！共 {col.count()} 条记录\n")
 
+docs_dir = os.path.join(BASE, "docs")
+all_pdfs = sorted(f for f in os.listdir(docs_dir) if f.lower().endswith(".pdf"))
+public_docs = [f for f in all_pdfs if f in PUBLIC_FILES]
+internal_docs = [f for f in all_pdfs if f not in PUBLIC_FILES]
 
-# 公开版：随时可建
-build(os.path.join(BASE, "docs", "higold_manual.pdf"), "higold_public")
+print("公开库将收录：", public_docs)
+print("内部库将收录：", internal_docs, "\n")
 
-# 内部版：仅当本地存在真手册时才建（云端没有这个文件，天然隔离）
-internal_pdf = os.path.join(BASE, "docs", "悍高集团内部控制管理手册.pdf")
-if os.path.exists(internal_pdf):
-    print(">>> 检测到内部控制手册（保密级别：内部），仅在本机建库，不用于公网部署")
-    build(internal_pdf, "higold_internal")
-else:
-    print(">>> 未找到内部手册，跳过内部库（公网部署时属正常情况）")
+if public_docs:
+    rebuild("higold_public", public_docs)
+if internal_docs:
+    rebuild("higold_internal", internal_docs)
+
+print("全部建库完成。本地打开 app.py 即可查询新资料。")

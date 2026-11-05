@@ -66,22 +66,30 @@ def load_components():
 embed_client, llm, db = load_components()
 
 # ---------- 云端首次启动：自动建公开版知识库 ----------
-# 公网环境没有 db 文件夹，检测到缺少公开库时，现场从手册 PDF 重建（约 10 秒）
+# 公网环境没有 db 文件夹，检测到缺少公开库时，现场重建。
+# 云端 docs/ 里只有白名单放行的公开资料（.gitignore 拦截了其余文件），
+# 所以这里可以放心读取 docs/ 里的全部 PDF——能到云端的本来就都是公开的。
 def ensure_public_kb():
     if "higold_public" not in {c.name for c in db.list_collections()}:
         from pypdf import PdfReader
         from langchain_text_splitters import RecursiveCharacterTextSplitter
-        text = "\n".join(p.extract_text() or "" for p in
-                         PdfReader(os.path.join(BASE, "docs", "higold_manual.pdf")).pages)
-        chunks = RecursiveCharacterTextSplitter(
-            chunk_size=500, chunk_overlap=50).split_text(text)
+        docs_dir = os.path.join(BASE, "docs")
         col_new = db.get_or_create_collection("higold_public")
-        for i in range(0, len(chunks), 16):
-            batch = chunks[i:i + 16]
-            res = embed_client.embeddings.create(model="BAAI/bge-m3", input=batch)
-            col_new.add(ids=[f"kb_{i+j}" for j in range(len(batch))],
-                        documents=batch,
-                        embeddings=[d.embedding for d in res.data])
+        total = 0
+        for name in sorted(f for f in os.listdir(docs_dir)
+                           if f.lower().endswith(".pdf")):
+            text = "\n".join(p.extract_text() or "" for p in
+                             PdfReader(os.path.join(docs_dir, name)).pages)
+            chunks = RecursiveCharacterTextSplitter(
+                chunk_size=500, chunk_overlap=50).split_text(text)
+            for i in range(0, len(chunks), 16):
+                batch = chunks[i:i + 16]
+                res = embed_client.embeddings.create(model="BAAI/bge-m3", input=batch)
+                col_new.add(ids=[f"kb_{total + j}" for j in range(len(batch))],
+                            documents=batch,
+                            embeddings=[d.embedding for d in res.data])
+                total += len(batch)
+            print(f"[云端建库] {name}: {len(chunks)} 块")
 
 ensure_public_kb()
 
@@ -142,7 +150,39 @@ for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.write(m["content"])
 
-if q := st.chat_input("输入问题，例如：采购业务的审批流程是怎样的？"):
+# ---------- 推荐提问：根据所选知识库的真实内容现场生成（生成一次后缓存复用） ----------
+@st.cache_data(show_spinner="正在根据资料生成推荐问题……")
+def suggest_questions(collection: str, n_docs: int) -> list:
+    """从库里抽几段原文，让 DeepSeek 猜'用户最可能问什么'"""
+    try:
+        docs_ = db.get_collection(collection).get(limit=6)["documents"]
+        if not docs_:
+            return []
+        sample = "\n".join(d[:150] for d in docs_)
+        res = llm.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system",
+                 "content": "根据以下企业资料，提出3个用户最可能问的问题。"
+                            "每行一个，不要编号，不要解释，直接输出问题。"},
+                {"role": "user", "content": sample},
+            ])
+        qs = [q.strip(" 0123456789.、·-") for q in
+              res.choices[0].message.content.splitlines() if q.strip()]
+        return qs[:3]
+    except Exception:
+        return []          # 网络或接口异常时静默降级：不显示推荐，不影响问答
+
+clicked = None
+sugs = suggest_questions(COLLECTION, col.count())
+if sugs:
+    st.caption("💡 可以这样问：")
+    row = st.columns(len(sugs))
+    for box, question in zip(row, sugs):
+        if box.button(question, key=f"sug_{COLLECTION}_{question}"):
+            clicked = question
+
+if q := (st.chat_input("输入问题，例如：宿舍管理有什么规定？") or clicked):
     st.session_state.messages.append({"role": "user", "content": q})
     with st.chat_message("user"):
         st.write(q)
