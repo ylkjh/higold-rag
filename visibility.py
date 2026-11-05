@@ -1,0 +1,91 @@
+# -*- coding: utf-8 -*-
+"""内容分级：判断一段文字是"可公开的制度流程"还是"不能外传的实际数据"
+--------------------------------------------------------------------
+设计原则（按内容性质分，不按文件类型分）：
+  可公开  -> 制度、流程、规范、职责、审批权限、管理要求、操作步骤
+  不可公开 -> 报价单、单价、合同金额、客户/供应商名单、联系人、工资表、
+             身份证/银行卡/税号、真实经营数据（营收、净利润、成本）
+
+判定方式：把文本按句切开，逐句检查。只要有一个句子命中"实际数据"特征，
+这一整块（500 字）就判为内部，宁严勿宽——宁可少公开一段，不可漏出去一条。
+
+为什么"金额阈值"不算敏感：
+  "采购金额 50 万元以上需总经理审批" 是制度条款，可以公开；
+  "本次采购单价 35.6 元，总价 128,000 元" 是真实交易数据，不能公开。
+  区分方式 = 敏感词（报价/单价/成本…）与金额出现在同一句才算数据。
+--------------------------------------------------------------------
+"""
+import re
+
+# ---------- 1. 表单字段类：带冒号 + 具体内容，说明填了真实信息 ----------
+FIELD_DATA = re.compile(
+    r"(客户|供应商|厂商|联系人|收款人|开户行|账号|税号|纳税人识别号|"
+    r"合同编号|订单号|发票号|报价|单价|总价|金额)\s*[:：]\s*\S"
+)
+
+# ---------- 2. 明确不能外传的实体/台账 ----------
+# 注意：写"身份证号"而不是"身份证"——制度里的"伪造假身份证"是违纪条款，
+# 属于可公开内容，不能误判；真实号码由下面的 PERSONAL 正则兜住。
+HARD_SENSITIVE = re.compile(
+    r"身份证号|身份证复印件|银行卡号|银行账号|开户许可证|营业执照号|"
+    r"工资表|薪资明细|社保基数|个人所得税|"
+    r"客户名单|供应商名单|通讯录|报价单|价格表|成本明细|"
+    r"投标底价|返点|佣金比例"
+)
+
+# ---------- 3. 个人隐私：手机号、身份证号、长数字账号 ----------
+PERSONAL = re.compile(r"1[3-9]\d{9}|\d{17}[\dXx]|\b\d{16,19}\b")
+
+# ---------- 4. 金额 + 交易语境：真实报价/成本/结算数据 ----------
+AMOUNT = re.compile(r"\d[\d,\.]*\s*(?:万元|万|元|块)")
+TRADE_CTX = re.compile(
+    r"报价|单价|总价|含税|不含税|折扣|毛利|利润率|成本价|"
+    r"结算价|佣金|返点|让利|底价|投标价|成交价"
+)
+
+# ---------- 5. 真实经营数据（只认明确的财务指标，避免"成本控制"这类制度用语误伤） ----------
+FIN_DATA = re.compile(
+    r"(营业收入|营业额|净利润|利润总额|毛利率|资产负债率|"
+    r"销售额|产值|年度营收)\s*(为|是|约|达到|共计)?\s*\d"
+)
+
+
+def is_sensitive_sentence(sentence: str) -> bool:
+    """单句判定：命中任意一条实际数据特征 -> 不可公开"""
+    if FIELD_DATA.search(sentence):
+        return True
+    if HARD_SENSITIVE.search(sentence):
+        return True
+    if PERSONAL.search(sentence):
+        return True
+    if TRADE_CTX.search(sentence) and AMOUNT.search(sentence):
+        return True
+    if FIN_DATA.search(sentence):
+        return True
+    return False
+
+
+def is_public_block(text: str) -> bool:
+    """整块判定：所有句子都干净才算可公开"""
+    for sentence in re.split(r"[。！？；\n]", text):
+        if sentence.strip() and is_sensitive_sentence(sentence):
+            return False
+    return True
+
+
+def why_sensitive(text: str) -> str:
+    """给出敏感原因（建库时打印，方便人工复核）"""
+    for sentence in re.split(r"[。！？；\n]", text):
+        if not sentence.strip():
+            continue
+        if FIELD_DATA.search(sentence):
+            return "表单字段：" + sentence.strip()[:28]
+        if HARD_SENSITIVE.search(sentence):
+            return "敏感信息：" + sentence.strip()[:28]
+        if PERSONAL.search(sentence):
+            return "个人隐私：" + sentence.strip()[:28]
+        if TRADE_CTX.search(sentence) and AMOUNT.search(sentence):
+            return "报价金额：" + sentence.strip()[:28]
+        if FIN_DATA.search(sentence):
+            return "经营数据：" + sentence.strip()[:28]
+    return ""

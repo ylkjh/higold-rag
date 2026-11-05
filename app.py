@@ -82,22 +82,50 @@ def kb_ready() -> bool:
     return bool(metas) and "category" in (metas[0] or {})
 
 
+def load_docs() -> list:
+    """准备建库原料，返回 [(source, category, text), ...]
+
+    本地：docs/ 里有原始 PDF -> 全量读（含内部内容，只在本机）
+    云端：PDF 从未上传，只有 docs/public/*.txt（建库时导出的脱敏公开版）
+           -> 读这些 txt，云端因此只可能拿到可公开的片段
+    """
+    out = []
+    docs_dir = os.path.join(BASE, "docs")
+    pdfs = sorted(f for f in os.listdir(docs_dir) if f.lower().endswith(".pdf")) \
+        if os.path.isdir(docs_dir) else []
+    if pdfs:
+        from pypdf import PdfReader
+        for name in pdfs:
+            text = "\n".join(p.extract_text() or "" for p in
+                             PdfReader(os.path.join(docs_dir, name)).pages)
+            out.append((name.rsplit(".", 1)[0], classify(name, text), text))
+        return out
+
+    pub_dir = os.path.join(docs_dir, "public")
+    if os.path.isdir(pub_dir):
+        for name in sorted(f for f in os.listdir(pub_dir) if f.endswith(".txt")):
+            with open(os.path.join(pub_dir, name), encoding="utf-8") as f:
+                text = f.read()
+            stem = name[:-4]
+            out.append((stem, classify(stem + ".pdf", text), text))
+    return out
+
+
 def ensure_kb():
     if kb_ready():
         return
-    from pypdf import PdfReader
     from langchain_text_splitters import RecursiveCharacterTextSplitter
     try:
         db.delete_collection(KB)          # 旧版本数据没有类别标签，删掉重建
     except Exception:
         pass
-    docs_dir = os.path.join(BASE, "docs")
+    docs = load_docs()
+    if not docs:
+        st.error("没有找到任何资料：本地需要 docs/*.pdf，云端需要 docs/public/*.txt")
+        return
     col_new = db.get_or_create_collection(KB)
     total = 0
-    for name in sorted(f for f in os.listdir(docs_dir) if f.lower().endswith(".pdf")):
-        text = "\n".join(p.extract_text() or "" for p in
-                         PdfReader(os.path.join(docs_dir, name)).pages)
-        cat = classify(name, text)
+    for stem, cat, text in docs:
         chunks = RecursiveCharacterTextSplitter(
             chunk_size=500, chunk_overlap=50).split_text(text)
         for i in range(0, len(chunks), 16):
@@ -106,10 +134,10 @@ def ensure_kb():
             col_new.add(ids=[f"kb_{total + j}" for j in range(len(batch))],
                         documents=batch,
                         embeddings=[d.embedding for d in res.data],
-                        metadatas=[{"source": name.rsplit(".", 1)[0],
-                                    "category": cat}] * len(batch))
+                        metadatas=[{"source": stem, "category": cat,
+                                    "visibility": "public"}] * len(batch))
             total += len(batch)
-        print(f"[自动建库] {name} -> {label_of(cat)}: {len(chunks)} 块")
+        print(f"[自动建库] {stem} -> {label_of(cat)}: {len(chunks)} 块")
 
 ensure_kb()
 col = db.get_collection(KB)
