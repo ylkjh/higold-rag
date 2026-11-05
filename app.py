@@ -171,18 +171,39 @@ def category_stats(collection: str, n_docs: int) -> list:
 
 
 SYSTEM_PROMPT = (
-    "你是悍高集团的知识库助手。只根据下面提供的手册资料回答问题，"
-    "资料里没有的内容就直说'手册中未提及'，不要编造。\n"
+    "你是悍高集团的知识库助手。只能使用下面【手册资料】里的内容作答，"
+    "不得使用资料以外的知识，也不得编造。\n"
+    "\n"
+    "请严格按以下规则回答：\n"
+    "1. 资料能回答用户的问题：直接给出答案，并在末尾另起一行标注依据，"
+    "格式为「依据：《资料名》」。\n"
+    "2. 资料不能回答用户的问题，按下面两步做：\n"
+    "   ① 先用一句话明确说明：手册中没有关于「用户所问内容」的规定或说明；\n"
+    "   ② 再检查资料里有没有同一业务领域、可以替代的内容：\n"
+    "      - 有：另起一段写「不过手册里有相关内容：」，然后用「问：」提出一个"
+    "与该主题接近、且资料能回答的问题，用「答：」给出答案，最后标注依据；\n"
+    "      - 没有：不要强行关联，直接说手册里也没有相近内容，并建议用户换一个"
+    "问法（例如按制度名称或流程名称提问）。\n"
+    "3. 不要输出「作为AI」「我无法确定」这类免责话术；不要说「未提及」三个字就结束，"
+    "务必按上面的结构给出替代内容或换问法建议。\n"
+    "\n"
     "【手册资料】\n{context}"
 )
 
 
 def retrieve(question: str, k: int = 5) -> str:
     """检索：问题变向量 -> Chroma 全库找最相关的 k 块原文
-    注意：检索始终覆盖全部资料，不受侧边栏所选类别限制。"""
+
+    每段前面带上《来源资料名》，让模型能标注依据、也能据此提相关问题。
+    注意：检索始终覆盖全部资料，不受侧边栏所选类别限制。
+    """
     vec = embed_client.embeddings.create(model="BAAI/bge-m3", input=[question])
-    res = col.query(query_embeddings=vec.data[0].embedding, n_results=k)
-    return "\n----\n".join(res["documents"][0])
+    res = col.query(query_embeddings=vec.data[0].embedding, n_results=k,
+                    include=["documents", "metadatas"])
+    blocks = []
+    for doc, meta in zip(res["documents"][0], res["metadatas"][0]):
+        blocks.append(f"《{meta.get('source', '手册资料')}》\n{doc}")
+    return "\n----\n".join(blocks)
 
 
 # @traceable：每次问答在 LangSmith 生成一条完整追踪记录
@@ -259,14 +280,51 @@ def suggest_questions(collection: str, category, n_docs: int) -> list:
         return []          # 网络或接口异常时静默降级：不显示推荐，不影响问答
 
 
-clicked = None
-sugs = suggest_questions(KB, CATEGORY, col.count())
-if sugs:
-    st.caption(f"💡 可以这样问（{picked}）：" if CATEGORY else "💡 可以这样问：")
-    row = st.columns(len(sugs))
-    for box, question in zip(row, sugs):
-        if box.button(question, key=f"sug_{picked}_{question}"):
-            clicked = question
+def looks_not_found(text: str) -> bool:
+    """判断这次回答是不是"手册里没有"——只看开头，因为提示词要求先说结论"""
+    head = (text or "")[:150]
+    return any(k in head for k in ("手册中没有", "手册里没有", "没有关于",
+                                   "没有找到", "未收录", "没有相关"))
+
+
+@st.cache_data(show_spinner="正在找手册里能回答的相关问题……")
+def related_questions(question: str, n_docs: int) -> list:
+    """用户问的内容手册没有时，挑几个"相近且手册能回答"的问题让他换个方向
+
+    做法：拿原问题检索到的片段当线索，让 DeepSeek 提 3 个
+    同业务领域、且这些片段确实能回答的问题。生成一次后缓存，不重复花钱。
+    """
+    try:
+        ctx = retrieve(question)
+        res = llm.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system",
+                 "content": "用户在查一份企业制度手册，问了一个手册里没有直接答案的问题。"
+                            "请根据下面提供的手册内容，提出3个用户可能也想问、"
+                            "而且这些内容确实能回答的问题（与原问题属于同一业务领域）。"
+                            "每行一个，不要编号，不要解释，直接输出问题。"},
+                {"role": "user", "content": f"用户问：{question}\n\n手册内容：\n{ctx}"},
+            ])
+        qs = [q.strip(" 0123456789.、·-") for q in
+              res.choices[0].message.content.splitlines() if q.strip()]
+        return qs[:3]
+    except Exception:
+        return []
+
+
+def render_related():
+    """画"换个方向试试"的按钮，返回被点击的问题"""
+    rel = st.session_state.get("related")
+    if not rel or not rel.get("list"):
+        return None
+    st.caption("📌 手册里没有你问的内容，这几个问题手册能答，要不要试试：")
+    cols = st.columns(len(rel["list"]))
+    for box, rq in zip(cols, rel["list"]):
+        if box.button(rq, key=f"rel_{rq}"):
+            return rq
+    return None
+
 
 # ---------- 聊天界面（会话历史保存在 st.session_state） ----------
 if "messages" not in st.session_state:
@@ -276,10 +334,24 @@ for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.write(m["content"])
 
+# ---------- 提问引导：有"相关问题"就优先显示它，否则显示常规推荐 ----------
+clicked = None
+if st.session_state.get("related"):
+    clicked = render_related()
+else:
+    sugs = suggest_questions(KB, CATEGORY, col.count())
+    if sugs:
+        st.caption(f"💡 可以这样问（{picked}）：" if CATEGORY else "💡 可以这样问：")
+        row = st.columns(len(sugs))
+        for box, question in zip(row, sugs):
+            if box.button(question, key=f"sug_{picked}_{question}"):
+                clicked = question
+
 placeholder = (f"想了解{picked}的哪些规定？" if CATEGORY
                else "输入问题，例如：宿舍管理有什么规定？")
 
 if q := (st.chat_input(placeholder) or clicked):
+    st.session_state.pop("related", None)          # 已经重新提问，清掉上轮的相关问题
     st.session_state.messages.append({"role": "user", "content": q})
     with st.chat_message("user"):
         st.write(q)
@@ -287,3 +359,8 @@ if q := (st.chat_input(placeholder) or clicked):
     with st.chat_message("assistant"):
         answer = st.write_stream(ask(q))
     st.session_state.messages.append({"role": "assistant", "content": answer})
+
+    # 手册里没有 -> 生成"相近且手册能回答"的问题，rerun 后显示在回答下方
+    if looks_not_found(answer):
+        st.session_state["related"] = {"list": related_questions(q, col.count())}
+        st.rerun()
