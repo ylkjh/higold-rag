@@ -19,6 +19,7 @@ import chromadb
 import streamlit as st
 from dotenv import load_dotenv
 
+import guard
 from categories import classify, label_of, CATEGORIES, OTHER_KEY, AUTO_PREFIX
 from indexing import KB, index_docs
 from retrieval import hybrid_search
@@ -57,6 +58,34 @@ st.caption("基于资料的 RAG 问答 · 答案只来自手册原文")
 # 没配就不拦（避免把自己锁在门外），侧边栏会提示"公开访问"。
 ACCESS_PASSWORD = get_key("ACCESS_PASSWORD")
 MAX_QUERIES = int(get_key("MAX_QUERIES") or 60)
+
+# ---------- 防刷配额（三层，服务端计数，刷新页面绕不过） ----------
+# 配在 Secrets / .env 里可覆盖；不配用默认值。
+DAILY_GLOBAL_LIMIT = int(get_key("DAILY_GLOBAL_LIMIT") or 300)   # 全站每天总次数（熔断线）
+DAILY_IP_LIMIT = int(get_key("DAILY_IP_LIMIT") or 30)            # 单 IP 每天次数
+MIN_INTERVAL_SEC = float(get_key("MIN_INTERVAL_SEC") or 2)       # 单 IP 最小提问间隔（秒）
+MAX_Q_CHARS = int(get_key("MAX_Q_CHARS") or 300)                 # 单条问题最长字数
+guard.init()
+
+
+def client_ip():
+    """取访问者 IP：云端由反向代理放在 X-Forwarded-For 里
+
+    本地开发没有这个头 -> 返回 None，此时只走"全站总配额"，
+    不会因为所有人共用 'unknown' 而被误伤。
+    """
+    try:
+        h = st.context.headers
+        for k in ("X-Forwarded-For", "X-Real-Ip"):
+            v = h.get(k)
+            if v:
+                return v.split(",")[0].strip()
+    except Exception:
+        pass
+    return None
+
+
+CLIENT_IP = client_ip()
 
 if ACCESS_PASSWORD and not st.session_state.get("authed"):
     st.info("🔒 这是内部知识库，需要访问密码。")
@@ -240,7 +269,9 @@ def condense_question(question: str, history: list) -> str:
                             "完整问题。只输出改写后的问题本身，不要解释、不要加引号。"
                             "如果最新提问本身已经完整，就原样输出。"},
                 {"role": "user", "content": f"对话历史：\n{convo}\n\n最新提问：{question}"},
-            ])
+            ],
+            max_tokens=120,          # 改写只要一句话，限死输出长度
+        )
         out = (r.choices[0].message.content or "").strip()
         return out or question
     except Exception:
@@ -271,6 +302,7 @@ def ask(question: str):
         model="deepseek-chat",
         messages=msgs,
         stream=True,
+        max_tokens=800,          # 单次回答上限，避免被诱导写长文烧额度
     )
     for chunk in stream:
         if chunk.choices and chunk.choices[0].delta.content:
@@ -293,6 +325,9 @@ with st.sidebar:
 
     st.caption("提示：类别只影响下方推荐提问的方向，搜索始终覆盖全部资料")
     st.caption("🔒 已启用访问密码" if ACCESS_PASSWORD else "🌐 公开访问（未设密码）")
+    _s = guard.stats(DAILY_IP_LIMIT, DAILY_GLOBAL_LIMIT)
+    st.caption(f"🧮 今日全站剩余额度：{_s['global_left']} / {DAILY_GLOBAL_LIMIT} 次"
+               f"（单 IP 上限 {DAILY_IP_LIMIT} 次/天）")
     if st.button("🗑️ 清空对话", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
@@ -325,7 +360,9 @@ def suggest_questions(collection: str, category, n_docs: int) -> list:
                             "提出3个用户最可能问的问题。"
                             "每行一个，不要编号，不要解释，直接输出问题。"},
                 {"role": "user", "content": sample},
-            ])
+            ],
+            max_tokens=200,
+        )
         qs = [q.strip(" 0123456789.、·-") for q in
               res.choices[0].message.content.splitlines() if q.strip()]
         return qs[:3]
@@ -358,7 +395,9 @@ def related_questions(question: str, n_docs: int) -> list:
                             "而且这些内容确实能回答的问题（与原问题属于同一业务领域）。"
                             "每行一个，不要编号，不要解释，直接输出问题。"},
                 {"role": "user", "content": f"用户问：{question}\n\n手册内容：\n{ctx}"},
-            ])
+            ],
+            max_tokens=200,
+        )
         qs = [q.strip(" 0123456789.、·-") for q in
               res.choices[0].message.content.splitlines() if q.strip()]
         return qs[:3]
@@ -404,18 +443,39 @@ placeholder = (f"想了解{picked}的哪些规定？" if CATEGORY
                else "输入问题，例如：宿舍管理有什么规定？")
 
 if q := (st.chat_input(placeholder) or clicked):
-    # 会话提问上限：防止公网被脚本刷爆 API 额度
+    q = (q or "").strip()
+
+    # ① 提问长度上限：超长问题既烧 token，也是脚本灌水的典型特征
+    if len(q) > MAX_Q_CHARS:
+        st.warning(f"问题太长了（{len(q)} 字），请压缩到 {MAX_Q_CHARS} 字以内。")
+        st.stop()
+
+    # ② 会话内软限制（挡手滑，不是安全防线）
     st.session_state["qcount"] = st.session_state.get("qcount", 0) + 1
     if st.session_state["qcount"] > MAX_QUERIES:
-        st.error(f"本次会话提问已达上限（{MAX_QUERIES} 次），刷新页面可重新开始。")
+        st.error(f"本次会话提问已达上限（{MAX_QUERIES} 次），请明天再试。")
         st.stop()
+
+    # ③ 服务端三层配额：计数存在 SQLite 里，刷新页面 / 换无痕窗口都绕不过
+    gate = guard.check(CLIENT_IP, DAILY_IP_LIMIT, DAILY_GLOBAL_LIMIT, MIN_INTERVAL_SEC)
+    if not gate["ok"]:
+        st.warning(gate["reason"])
+        st.stop()
+
     st.session_state.pop("related", None)          # 已经重新提问，清掉上轮的相关问题
     st.session_state.messages.append({"role": "user", "content": q})
     with st.chat_message("user"):
         st.write(q)
 
+    cached = guard.cache_get(q)                    # ④ 同一问题第二次问：不发请求、不花钱
     with st.chat_message("assistant"):
-        answer = st.write_stream(ask(q))
+        if cached:
+            st.write(cached)
+            st.caption("⚡ 命中缓存，本次未调用模型")
+            answer = cached
+        else:
+            guard.consume(CLIENT_IP)               # 只有真要发请求才记一次配额
+            answer = st.write_stream(ask(q))
         rq = st.session_state.get("last_query")
         if rq and rq != q:
             st.caption(f"🔎 追问理解成：{rq}")
@@ -426,6 +486,7 @@ if q := (st.chat_input(placeholder) or clicked):
             if srcs:
                 st.caption(f"📚 检索来源：{srcs}（混合检索 + 精排）")
     st.session_state.messages.append({"role": "assistant", "content": answer})
+    guard.cache_put(q, answer)                     # 写缓存，下次同问直接返回
 
     # 手册里没有 -> 生成"相近且手册能回答"的问题，rerun 后显示在回答下方
     if looks_not_found(answer):
