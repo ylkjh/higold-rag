@@ -1,32 +1,63 @@
 # -*- coding: utf-8 -*-
-"""访问凭证：用「带 key 的链接」代替密码框
+"""访问控制：公司账号登录（OIDC）+ 邮箱白名单
 
-为什么不弹密码框：
-    密码要口口相传，谁泄露了查不出来，而且每次访问都得输一遍。
-    把随机 key 放进链接（?k=xxxx），点开即进，无感；
-    每人一条独立 key，谁用超了、外传了，能定位、能单独吊销。
+主方案（B）：
+    用 Streamlit 内置的 st.login() 接 Google / 微软（Entra ID）/ Auth0 等
+    OIDC 提供方。用户点一次"用公司账号登录"，跳转到公司账号页，
+    登录后回到应用，我们校验他的邮箱是否在白名单里。
 
-Secrets 里这样配（一行一个人）：
+    好处：身份是真实的，链接转发无效（对方得用自己账号登录），
+    谁问了什么、用了多少次都能对上人。
 
-    ACCESS_KEYS = '''
-    张三=7fK2pQ9x
-    李四=m3R8sT1v
-    '''
+    配置在 Secrets 里（[auth] 段由 Streamlit 自己读取）：
+        [auth]
+        redirect_uri = "https://你的应用/oauth2callback"
+        cookie_secret = "随机字符串"
+        client_id = "..."
+        client_secret = "..."
+        server_metadata_url = "https://login.microsoftonline.com/<租户ID>/v2.0/.well-known/openid-configuration"
 
-访问链接：https://你的应用地址/?k=7fK2pQ9x
-删除某一行的 key 即吊销该人的访问权（下次刷新就进不来）。
+        ALLOWED_EMAILS = "zhangsan@higold.com.cn, lisi@higold.com.cn, @higold.com.cn"
 
-生成新 key：python auth.py 张三 李四
+    白名单支持两种写法：完整邮箱、@域名（整个域名都放行）。
+
+备用（A，已不推荐）：链接邀请码 ?k=xxx，见 parse_keys/resolve。
 """
 import secrets
 import sys
 
 
-def parse_keys(raw) -> dict:
-    """把 Secrets 里的多行/逗号分隔文本解析成 {key: 姓名}
+# ---------- 邮箱白名单 ----------
+def parse_emails(raw) -> list:
+    """把多行/逗号/分号分隔的白名单拆成列表（统一小写）"""
+    if not raw:
+        return []
+    txt = str(raw).replace("，", ",").replace("；", ";").replace("\n", ",")
+    txt = txt.replace(";", ",").replace(" ", ",")
+    return [e.strip().lower() for e in txt.split(",") if e.strip()]
 
-    支持 "姓名=key"，也支持只写 key（自动命名 成员1、成员2）。
+
+def email_allowed(email, raw) -> bool:
+    """邮箱是否在白名单里；支持 @域名 通配整个域
+
+    白名单为空 -> 一律拒绝（宁可进不来，也不能变成公开访问）。
     """
+    email = (email or "").strip().lower()
+    rules = parse_emails(raw)
+    if not email or not rules:
+        return False
+    for r in rules:
+        if r.startswith("@"):
+            if email.endswith(r):
+                return True
+        elif email == r:
+            return True
+    return False
+
+
+# ---------- 备用：链接邀请码 ----------
+def parse_keys(raw) -> dict:
+    """解析 ACCESS_KEYS 为 {key: 姓名}，支持 "姓名=key" 或只写 key"""
     out = {}
     if not raw:
         return out
@@ -51,18 +82,19 @@ def resolve(query_value, raw):
     """用 URL 里的 k 换取姓名；无效返回 None"""
     if not query_value:
         return None
-    keys = parse_keys(raw)
-    return keys.get(str(query_value).strip())
+    return parse_keys(raw).get(str(query_value).strip())
 
 
-def make_key(n: int = 10) -> str:
-    """生成一个足够随机的短 key（64^10 种可能，猜不出来）"""
-    return secrets.token_urlsafe(n).replace("-", "x").replace("_", "y")[:14]
+# ---------- 小工具 ----------
+def make_key(n: int = 14) -> str:
+    """随机串（用于 cookie_secret 或备用邀请码）"""
+    return secrets.token_urlsafe(n)
 
 
 if __name__ == "__main__":
-    names = sys.argv[1:] or ["成员1"]
-    print("\n把下面几行贴进 Secrets 的 ACCESS_KEYS（三引号里）：\n")
-    for nm in names:
-        print(f"{nm}={make_key()}")
-    print("\n访问链接：https://你的应用地址/?k=<上面等号右边的key>")
+    print("cookie_secret（贴到 Secrets 的 [auth] 段）:")
+    print(make_key(32))
+    if len(sys.argv) > 1:
+        print("\n备用邀请码：")
+        for nm in sys.argv[1:]:
+            print(f"{nm}={make_key(10)}")

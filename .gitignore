@@ -13,6 +13,9 @@ db/
 # 防刷计数库：里面有访问者 IP 和提问次数，属于运行数据，不上传
 .guard/
 
+# 本地 Secrets（如果为了测试建过，绝不能上传）
+.streamlit/secrets.toml
+
 # Python 运行产物
 __pycache__/
 *.pyc
