@@ -72,14 +72,17 @@ KB = "higold_kb"   # 唯一知识库
 
 # ---------- 首次启动：自动建库（云端 db 为空时现场重建，只读手边有的资料） ----------
 def kb_ready() -> bool:
-    """库里已有数据、且数据带 category 标签 -> 不用重建"""
+    """库里已有数据、且数据带类别和公开级别标签 -> 不用重建"""
     if KB not in {c.name for c in db.list_collections()}:
         return False
     col_tmp = db.get_collection(KB)
     if col_tmp.count() == 0:
         return False
     metas = col_tmp.get(limit=1, include=["metadatas"])["metadatas"] or []
-    return bool(metas) and "category" in (metas[0] or {})
+    if not metas:
+        return False
+    meta = metas[0] or {}
+    return "category" in meta and "visibility" in meta
 
 
 def load_docs() -> list:
