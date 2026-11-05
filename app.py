@@ -7,7 +7,9 @@
 
 两套知识库（权限隔离设计）：
   公开版 higold_public   ：整理自公开资料，可随代码部署到公网
-  内部版 higold_internal ：公司内部控制手册，仅本地存在（不进 Git、不上公网）
+  内部版 higold_internal ：公司受控文件，仅本地存在（不进 Git、不上公网）
+
+侧边栏"资料模块"：按来源 PDF 自动分组，选中模块后检索只在该资料内进行。
 --------------------------------------------------------------------
 """
 import os
@@ -27,8 +29,6 @@ try:
 except FileNotFoundError:
     pass  # 本地没有 secrets.toml，用 .env 的值
 
-BASE = os.path.dirname(__file__)
-
 # ---------- 密钥：本地读 .env，云端读 Secrets，两边通吃 ----------
 def get_key(name: str) -> str:
     try:
@@ -36,8 +36,6 @@ def get_key(name: str) -> str:
             return st.secrets[name]
     except FileNotFoundError:
         pass                              # 本地没有 secrets.toml，走 .env
-    from dotenv import load_dotenv
-    load_dotenv(os.path.join(BASE, ".env"))
     return os.getenv(name)
 
 SILICONFLOW_KEY = get_key("SILICONFLOW_API_KEY")
@@ -87,30 +85,19 @@ def ensure_public_kb():
                 res = embed_client.embeddings.create(model="BAAI/bge-m3", input=batch)
                 col_new.add(ids=[f"kb_{total + j}" for j in range(len(batch))],
                             documents=batch,
-                            embeddings=[d.embedding for d in res.data])
+                            embeddings=[d.embedding for d in res.data],
+                            metadatas=[{"source": name.rsplit(".", 1)[0]}] * len(batch))
                 total += len(batch)
             print(f"[云端建库] {name}: {len(chunks)} 块")
 
 ensure_public_kb()
 
-# ---------- 侧边栏：选择知识库（按本机实际存在的库动态显示） ----------
-col_names = {c.name for c in db.list_collections()}
-choices = {"公开版手册（对外演示）": "higold_public"}
-if "higold_internal" in col_names:
-    choices["内部控制手册（仅本地）"] = "higold_internal"
-
-with st.sidebar:
-    kb_label = st.radio("选择知识库", list(choices.keys()), index=0)
-    COLLECTION = choices[kb_label]
-    st.info(
-        "**公开版**：整理自公开资料，可部署公网\n\n"
-        "**内部版**：公司受控文件，仅本机可用，禁止上传公网",
-        icon="🔒")
-    if st.button("🗑️ 清空对话"):
-        st.session_state.messages = []
-        st.rerun()
-
-col = db.get_collection(COLLECTION)
+# ---------- 工具函数：模块（来源资料）列表、检索、问答 ----------
+@st.cache_data(show_spinner=False)
+def get_sources(collection: str, n_docs: int) -> list:
+    """列出库里有哪些资料模块（按入库时打的 source 标签去重）"""
+    metas = db.get_collection(collection).get(include=["metadatas"])["metadatas"] or []
+    return sorted({(m or {}).get("source", "未分类") for m in metas})
 
 SYSTEM_PROMPT = (
     "你是悍高集团的知识库助手。只根据下面提供的手册资料回答问题，"
@@ -118,18 +105,21 @@ SYSTEM_PROMPT = (
     "【手册资料】\n{context}"
 )
 
-def retrieve(question: str, k: int = 4) -> str:
-    """检索：问题变向量 -> Chroma 找最相关的 k 块原文"""
+def retrieve(question: str, k: int = 4, source=None) -> str:
+    """检索：问题变向量 -> Chroma 找最相关的 k 块原文（可限定某个资料模块）"""
     vec = embed_client.embeddings.create(model="BAAI/bge-m3", input=[question])
-    res = col.query(query_embeddings=vec.data[0].embedding, n_results=k)
+    kw = {"query_embeddings": vec.data[0].embedding, "n_results": k}
+    if source:                                   # 选中模块时只在该资料内检索
+        kw["where"] = {"source": source}
+    res = col.query(**kw)
     return "\n----\n".join(res["documents"][0])
 
 # @traceable：每次问答在 LangSmith 生成一条完整追踪记录
 # （调用树：检索 -> 拼 Prompt -> LLM，网页上层层展开查看）
 @traceable
-def ask(question: str):
+def ask(question: str, source=None):
     """完整 RAG：检索 -> 拼 Prompt -> DeepSeek 流式回答"""
-    context = retrieve(question)
+    context = retrieve(question, source=source)
     stream = llm.chat.completions.create(
         model="deepseek-chat",
         messages=[
@@ -142,20 +132,45 @@ def ask(question: str):
         if chunk.choices and chunk.choices[0].delta.content:
             yield chunk.choices[0].delta.content
 
-# ---------- 聊天界面（会话历史保存在 st.session_state） ----------
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# ---------- 侧边栏：知识库 + 资料模块 + 清空对话 ----------
+# 模块显示名美化（没有映射的直接用文件名去掉 .pdf）
+PRETTY = {"higold_manual": "公司简介（公开）"}
 
-for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
-        st.write(m["content"])
+with st.sidebar:
+    kb_choices = {"公开版手册（对外演示）": "higold_public"}
+    if "higold_internal" in {c.name for c in db.list_collections()}:
+        kb_choices["内部控制手册（仅本地）"] = "higold_internal"
 
-# ---------- 推荐提问：根据所选知识库的真实内容现场生成（生成一次后缓存复用） ----------
-@st.cache_data(show_spinner="正在根据资料生成推荐问题……")
-def suggest_questions(collection: str, n_docs: int) -> list:
+    kb_label = st.radio("选择知识库", list(kb_choices.keys()), index=0)
+    COLLECTION = kb_choices[kb_label]
+
+    n_docs = db.get_collection(COLLECTION).count()
+    sources = get_sources(COLLECTION, n_docs)
+    src_of = {PRETTY.get(s, s): s for s in sources}       # 显示名 -> 标签名
+    cat_label = st.radio("按资料模块提问", ["全部资料"] + list(src_of),
+                         index=0,
+                         help="选定模块后，检索与推荐问题只来自这份资料")
+    CATEGORY = None if cat_label == "全部资料" else src_of[cat_label]
+
+    st.info(
+        "**公开版**：整理自公开资料，可部署公网\n\n"
+        "**内部版**：公司受控文件，仅本机可用，禁止上传公网",
+        icon="🔒")
+    if st.button("🗑️ 清空对话"):
+        st.session_state.messages = []
+        st.rerun()
+
+col = db.get_collection(COLLECTION)
+
+# ---------- 推荐提问：按所选模块的真实内容现场生成（生成一次后缓存复用） ----------
+@st.cache_data(show_spinner="正在根据该模块资料生成推荐问题……")
+def suggest_questions(collection: str, category, n_docs: int) -> list:
     """从库里抽几段原文，让 DeepSeek 猜'用户最可能问什么'"""
     try:
-        docs_ = db.get_collection(collection).get(limit=6)["documents"]
+        kw = {"limit": 6}
+        if category:                                     # 只从所选模块抽原文
+            kw["where"] = {"source": category}
+        docs_ = db.get_collection(collection).get(**kw)["documents"]
         if not docs_:
             return []
         sample = "\n".join(d[:150] for d in docs_)
@@ -174,13 +189,21 @@ def suggest_questions(collection: str, n_docs: int) -> list:
         return []          # 网络或接口异常时静默降级：不显示推荐，不影响问答
 
 clicked = None
-sugs = suggest_questions(COLLECTION, col.count())
+sugs = suggest_questions(COLLECTION, CATEGORY, col.count())
 if sugs:
-    st.caption("💡 可以这样问：")
+    st.caption(("【" + cat_label + "】") if CATEGORY else "💡 可以这样问：")
     row = st.columns(len(sugs))
     for box, question in zip(row, sugs):
-        if box.button(question, key=f"sug_{COLLECTION}_{question}"):
+        if box.button(question, key=f"sug_{COLLECTION}_{cat_label}_{question}"):
             clicked = question
+
+# ---------- 聊天界面（会话历史保存在 st.session_state） ----------
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.write(m["content"])
 
 if q := (st.chat_input("输入问题，例如：宿舍管理有什么规定？") or clicked):
     st.session_state.messages.append({"role": "user", "content": q})
@@ -188,5 +211,5 @@ if q := (st.chat_input("输入问题，例如：宿舍管理有什么规定？")
         st.write(q)
 
     with st.chat_message("assistant"):
-        answer = st.write_stream(ask(q))
+        answer = st.write_stream(ask(q, CATEGORY))
     st.session_state.messages.append({"role": "assistant", "content": answer})

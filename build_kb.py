@@ -49,7 +49,8 @@ def rebuild(collection_name: str, pdf_names: list) -> int:
             res = client.embeddings.create(model="BAAI/bge-m3", input=batch)
             col.add(ids=[f"{collection_name}_{total + j}" for j in range(len(batch))],
                     documents=batch,
-                    embeddings=[d.embedding for d in res.data])
+                    embeddings=[d.embedding for d in res.data],
+                    metadatas=[{"source": name.rsplit(".", 1)[0]} for _ in batch])
             total += len(batch)
         print(f"[{collection_name}] {name}: {len(chunks)} 块已入库")
     print(f"[{collection_name}] 完成！共 {total} 条记录\n")
