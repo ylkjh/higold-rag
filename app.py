@@ -535,7 +535,7 @@ if q := (st.chat_input(placeholder) or clicked):
                 f"《{h['source']}》" + (f"第{h['page']}页" if h.get("page") else "")
                 for h in hits if h.get("source")))
             if srcs:
-                st.caption(f"📚 检索来源：{srcs}（混合检索 + 精排）")
+                st.caption(f"📚 检索来源：{srcs}")
     st.session_state.messages.append({"role": "assistant", "content": answer})
     guard.cache_put(q, answer)                     # 写缓存，下次同问直接返回
 
