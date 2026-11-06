@@ -43,6 +43,16 @@ TRADE_CTX = re.compile(
     r"结算价|佣金|返点|让利|底价|投标价|成交价"
 )
 
+# ---------- 4b. 收费语境：对内/对外的运营收费标准也是实际价格数据 ----------
+# "冷水 5 元/吨""住宿 200 元/人"是真实定价，不是制度条款；
+# "元/单位"用通用匹配（元/次、元/度、元/月……都算），避免新单位漏网。
+# 与金额同句出现即判内部（"不收费""免收"这类句子一般不带金额，不会误伤）。
+PRICE_CTX = re.compile(
+    r"收费标准|水电费|水费|电费|燃气费|住宿费|房租|租金|押金|"
+    r"物业费|管理费|伙食费|餐费|停车费|"
+    r"元\s*/"
+)
+
 # ---------- 5. 真实经营数据（只认明确的财务指标，避免"成本控制"这类制度用语误伤） ----------
 FIN_DATA = re.compile(
     r"(营业收入|营业额|净利润|利润总额|毛利率|资产负债率|"
@@ -60,14 +70,25 @@ def is_sensitive_sentence(sentence: str) -> bool:
         return True
     if TRADE_CTX.search(sentence) and AMOUNT.search(sentence):
         return True
+    if PRICE_CTX.search(sentence) and AMOUNT.search(sentence):
+        return True
     if FIN_DATA.search(sentence):
         return True
     return False
 
 
+def _sentences(text: str) -> list:
+    """判级前的标准化：压掉所有空白再拆句
+
+    PDF / docx 抽出来的文字经常在数字中间换行（"100-500\\n元/次"），
+    不压掉的话金额和语境词会被拆进两句，凑不齐"金额+语境"就漏判了。
+    """
+    return re.split(r"[。！？；]", re.sub(r"\s+", "", text))
+
+
 def is_public_block(text: str) -> bool:
     """整块判定：所有句子都干净才算可公开"""
-    for sentence in re.split(r"[。！？；\n]", text):
+    for sentence in _sentences(text):
         if sentence.strip() and is_sensitive_sentence(sentence):
             return False
     return True
@@ -75,7 +96,7 @@ def is_public_block(text: str) -> bool:
 
 def why_sensitive(text: str) -> str:
     """给出敏感原因（建库时打印，方便人工复核）"""
-    for sentence in re.split(r"[。！？；\n]", text):
+    for sentence in _sentences(text):
         if not sentence.strip():
             continue
         if FIELD_DATA.search(sentence):
@@ -86,6 +107,8 @@ def why_sensitive(text: str) -> str:
             return "个人隐私：" + sentence.strip()[:28]
         if TRADE_CTX.search(sentence) and AMOUNT.search(sentence):
             return "报价金额：" + sentence.strip()[:28]
+        if PRICE_CTX.search(sentence) and AMOUNT.search(sentence):
+            return "收费标准：" + sentence.strip()[:28]
         if FIN_DATA.search(sentence):
             return "经营数据：" + sentence.strip()[:28]
     return ""

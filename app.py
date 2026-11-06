@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 
 import guard
 from categories import classify, label_of, CATEGORIES, OTHER_KEY, AUTO_PREFIX
-from indexing import KB, index_docs
+from indexing import KB, index_docs, extract_text
 from retrieval import hybrid_search
 
 BASE = os.path.dirname(__file__)
@@ -146,19 +146,18 @@ def kb_ready() -> bool:
 def load_docs() -> list:
     """准备建库原料，返回 [(source, category, text), ...]
 
-    本地：docs/ 里有原始 PDF -> 全量读（含内部内容，只在本机）
+    本地：docs/ 里有原始 PDF / docx -> 全量读（含内部内容，只在本机）
     云端：PDF 从未上传，只有 docs/public/*.txt（建库时导出的脱敏公开版）
            -> 读这些 txt，云端因此只可能拿到可公开的片段
     """
     out = []
     docs_dir = os.path.join(BASE, "docs")
-    pdfs = sorted(f for f in os.listdir(docs_dir) if f.lower().endswith(".pdf")) \
+    files = sorted(f for f in os.listdir(docs_dir)
+                   if f.lower().endswith((".pdf", ".docx"))) \
         if os.path.isdir(docs_dir) else []
-    if pdfs:
-        from pypdf import PdfReader
-        for name in pdfs:
-            text = "\n".join(p.extract_text() or "" for p in
-                             PdfReader(os.path.join(docs_dir, name)).pages)
+    if files:
+        for name in files:
+            text = extract_text(os.path.join(docs_dir, name))
             out.append((name.rsplit(".", 1)[0], classify(name, text), text))
         return out
 
@@ -178,7 +177,7 @@ def ensure_kb():
     from langchain_text_splitters import RecursiveCharacterTextSplitter  # noqa: F401
     docs = load_docs()
     if not docs:
-        st.error("没有找到任何资料：本地需要 docs/*.pdf，云端需要 docs/public/*.txt")
+        st.error("没有找到任何资料：本地需要 docs/ 里有 PDF 或 docx，云端需要 docs/public/*.txt")
         return
     with st.spinner("首次启动，正在建知识库（切块 + 向量化），约 20 秒……"):
         res = index_docs(db, [(s, c, t, (lambda _c: "public")) for s, c, t in docs],

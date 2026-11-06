@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""悍高知识库建库脚本：docs/ 里所有 PDF -> 分级 -> 切父子块 -> 向量化 -> 存入 Chroma
+"""悍高知识库建库脚本：docs/ 里所有 PDF / docx -> 分级 -> 切父子块 -> 向量化 -> 存入 Chroma
 --------------------------------------------------------------------------
 一次运行做三件事：
 
@@ -25,7 +25,7 @@
   FORCE_PUBLIC    整份强制公开（仅用于确认过不含敏感内容的文件）
 
 怎么加新资料：
-  1. 把 PDF 丢进 docs/
+  1. 把 PDF 或 docx 丢进 docs/（其他格式先另存为这两种）
   2. 运行  python build_kb.py
   类别与公开范围都会自动判定。
 --------------------------------------------------------------------------
@@ -34,13 +34,12 @@ import os
 import shutil
 
 from dotenv import load_dotenv
-from pypdf import PdfReader
 from openai import OpenAI
 import chromadb
 
 from categories import classify, label_of
 from visibility import is_public_block, why_sensitive, mask_public
-from indexing import index_docs, split_parent_child, KB
+from indexing import index_docs, split_parent_child, extract_text, KB
 
 BASE = os.path.dirname(__file__)
 load_dotenv(os.path.join(BASE, ".env"))
@@ -79,8 +78,7 @@ def rebuild(pdf_names: list, do_index: bool = True) -> None:
     print("\n========== 内容分级报告（按 300 字子块判定）==========")
     for name in pdf_names:
         stem = name.rsplit(".", 1)[0]
-        text = "\n".join(p.extract_text() or "" for p in
-                         PdfReader(os.path.join(BASE, "docs", name)).pages)
+        text = extract_text(os.path.join(BASE, "docs", name))
         if not text.strip():
             print(f"{name:<34} 无文字层（可能是扫描件），跳过")
             continue
@@ -143,11 +141,12 @@ def rebuild(pdf_names: list, do_index: bool = True) -> None:
 
 
 docs_dir = os.path.join(BASE, "docs")
-pdfs = sorted(f for f in os.listdir(docs_dir) if f.lower().endswith(".pdf"))
-if not pdfs:
-    raise SystemExit("docs/ 里没有 PDF，请先放入资料")
+docs = sorted(f for f in os.listdir(docs_dir)
+              if f.lower().endswith((".pdf", ".docx")))
+if not docs:
+    raise SystemExit("docs/ 里没有 PDF 或 docx，请先放入资料（其他格式请先另存为这两种）")
 
-rebuild(pdfs, do_index="--export-only" not in __import__("sys").argv)
+rebuild(docs, do_index="--export-only" not in __import__("sys").argv)
 
 # 清理旧版遗留集合
 for legacy in ("higold_public", "higold_internal"):

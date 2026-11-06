@@ -18,6 +18,8 @@
 """
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+import os
+
 KB = "higold_kb"
 
 # 父块：给大模型看的完整上下文
@@ -40,6 +42,28 @@ def split_parent_child(text: str) -> list:
         kids = _child_splitter.split_text(parent) or [parent]
         out.append((parent, kids))
     return out
+
+
+def extract_text(path: str) -> str:
+    """按扩展名抽正文：PDF 用 pypdf，docx 用 python-docx（段落 + 表格）
+
+    build_kb.py（本地建库）和 app.py（云端兜底建库）都从这里拿，
+    保证两种入口对同一份文件抽出的文字完全一致。
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".pdf":
+        from pypdf import PdfReader
+        return "\n".join(p.extract_text() or "" for p in PdfReader(path).pages)
+    if ext == ".docx":
+        from docx import Document as _Doc
+        doc = _Doc(path)
+        parts = [p.text for p in doc.paragraphs]
+        # 制度文件常把审批权限、标准放表格里，表格内容一并抽出
+        parts += ["  ".join(c.text.strip() for c in row.cells)
+                  for tbl in doc.tables for row in tbl.rows]
+        return "\n".join(x for x in parts if x)
+    raise ValueError(f"不支持的文件格式：{ext}（目前支持 PDF / docx，"
+                     f"其他格式请先另存为 docx 或 PDF）")
 
 
 def index_docs(db, items, embed_client, batch_size: int = 16, log=print) -> dict:
