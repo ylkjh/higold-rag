@@ -71,7 +71,7 @@ def brand_bg_css() -> str:
             "linear-gradient(180deg,rgba(255,255,255,.80) 0%,"
             "rgba(255,255,255,.70) 45%,rgba(255,255,255,.88) 100%),"
             "url('" + "data:image/jpeg;base64," + b64 + "');"
-            "background-size:cover;background-position:center;"
+            "background-size:cover;background-position:35% center;"
             "background-attachment:fixed;background-repeat:no-repeat;}"
             "</style>")
 
