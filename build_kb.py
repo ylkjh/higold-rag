@@ -39,7 +39,7 @@ import chromadb
 
 from categories import classify, label_of
 from visibility import is_public_block, why_sensitive, mask_public
-from indexing import index_docs, split_parent_child, extract_text, KB
+from indexing import index_docs, split_parent_child, extract_pages, KB
 
 BASE = os.path.dirname(__file__)
 load_dotenv(os.path.join(BASE, ".env"))
@@ -78,7 +78,7 @@ def rebuild(pdf_names: list, do_index: bool = True) -> None:
     print("\n========== 内容分级报告（按 300 字子块判定）==========")
     for name in pdf_names:
         stem = name.rsplit(".", 1)[0]
-        text = extract_text(os.path.join(BASE, "docs", name))
+        text, page_marks = extract_pages(os.path.join(BASE, "docs", name))
         if not text.strip():
             print(f"{name:<34} 无文字层（可能是扫描件），跳过")
             continue
@@ -114,7 +114,7 @@ def rebuild(pdf_names: list, do_index: bool = True) -> None:
         else:
             vis = lambda c: "public" if is_public_block(c) else "internal"
 
-        items.append((stem, cat, text, vis))
+        items.append((stem, cat, text, vis, page_marks))
 
         # ---------- 导出公开版（只有这部分会上 GitHub） ----------
         # 导出前做定点脱敏：签署栏里的员工姓名 -> ×××（版面保留，内容不丢）

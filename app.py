@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 
 import guard
 from categories import classify, label_of, CATEGORIES, OTHER_KEY, AUTO_PREFIX
-from indexing import KB, index_docs, extract_text
+from indexing import KB, index_docs, extract_pages
 from retrieval import hybrid_search
 
 BASE = os.path.dirname(__file__)
@@ -140,15 +140,18 @@ def kb_ready() -> bool:
         return False
     meta = metas[0] or {}
     # parent 是父子块方案新增的，缺它就说明是旧版数据，必须重建
-    return all(k in meta for k in ("category", "visibility", "parent"))
+    # 旧库没有 page 标签的也视为需要重建
+    return all(k in meta for k in ("category", "visibility", "parent", "page"))
 
 
 def load_docs() -> list:
     """准备建库原料，返回 [(source, category, text), ...]
 
     本地：docs/ 里有原始 PDF / docx -> 全量读（含内部内容，只在本机）
+          返回 (来源名, 类别, 正文, 页码锚点) 四元组
     云端：PDF 从未上传，只有 docs/public/*.txt（建库时导出的脱敏公开版）
            -> 读这些 txt，云端因此只可能拿到可公开的片段
+           txt 是按块合并导出的，页码信息在导出时丢了，锚点记 None
     """
     out = []
     docs_dir = os.path.join(BASE, "docs")
@@ -157,8 +160,8 @@ def load_docs() -> list:
         if os.path.isdir(docs_dir) else []
     if files:
         for name in files:
-            text = extract_text(os.path.join(docs_dir, name))
-            out.append((name.rsplit(".", 1)[0], classify(name, text), text))
+            text, page_marks = extract_pages(os.path.join(docs_dir, name))
+            out.append((name.rsplit(".", 1)[0], classify(name, text), text, page_marks))
         return out
 
     pub_dir = os.path.join(docs_dir, "public")
@@ -167,7 +170,7 @@ def load_docs() -> list:
             with open(os.path.join(pub_dir, name), encoding="utf-8") as f:
                 text = f.read()
             stem = name[:-4]
-            out.append((stem, classify(stem + ".pdf", text), text))
+            out.append((stem, classify(stem + ".pdf", text), text, None))
     return out
 
 
@@ -180,7 +183,8 @@ def ensure_kb():
         st.error("没有找到任何资料：本地需要 docs/ 里有 PDF 或 docx，云端需要 docs/public/*.txt")
         return
     with st.spinner("首次启动，正在建知识库（切块 + 向量化），约 20 秒……"):
-        res = index_docs(db, [(s, c, t, (lambda _c: "public")) for s, c, t in docs],
+        res = index_docs(db, [(s, c, t, (lambda _c: "public"), m)
+                              for s, c, t, m in docs],
                          embed_client, log=lambda s: print(s, flush=True))
     print(f"[建库完成] {res['children']} 子块 / {res['parents']} 父块")
 
@@ -219,7 +223,8 @@ SYSTEM_PROMPT = (
     "\n"
     "请严格按以下规则回答：\n"
     "1. 资料能回答用户的问题：直接给出答案，并在末尾另起一行标注依据，"
-    "格式为「依据：《资料名》」。\n"
+    "格式为「依据：《资料名》第 X 页」——每份资料开头的括号里标了页码，按它填；"
+    "如果那份资料的开头没有页码，就只写「依据：《资料名》」。\n"
     "2. 资料不能回答用户的问题，按下面两步做：\n"
     "   ① 先用一句话明确说明：手册中没有关于「用户所问内容」的规定或说明；\n"
     "   ② 再检查资料里有没有同一业务领域、可以替代的内容：\n"
@@ -250,8 +255,11 @@ def retrieve(question: str, k: int = 4):
                         include=["documents", "metadatas"])
         blocks, hits = [], []
         for doc, meta in zip(res["documents"][0], res["metadatas"][0]):
-            blocks.append(f"《{meta.get('source', '手册资料')}》\n{doc}")
-            hits.append({"source": meta.get("source", ""), "child": doc})
+            page = (meta or {}).get("page", "")
+            head = f"《{meta.get('source', '手册资料')}》" + (f"（第 {page} 页）" if page else "")
+            blocks.append(f"{head}\n{doc}")
+            hits.append({"source": meta.get("source", ""), "child": doc,
+                         "page": page})
         return "\n----\n".join(blocks), hits
 
 
@@ -498,8 +506,9 @@ if q := (st.chat_input(placeholder) or clicked):
             st.caption(f"🔎 追问理解成：{rq}")
         hits = st.session_state.get("last_hits") or []
         if hits:
-            srcs = "、".join(dict.fromkeys(f"《{h['source']}》" for h in hits
-                                          if h.get("source")))
+            srcs = "、".join(dict.fromkeys(
+                f"《{h['source']}》" + (f"第{h['page']}页" if h.get("page") else "")
+                for h in hits if h.get("source")))
             if srcs:
                 st.caption(f"📚 检索来源：{srcs}（混合检索 + 精排）")
     st.session_state.messages.append({"role": "assistant", "content": answer})

@@ -18,6 +18,7 @@
 """
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+import bisect
 import os
 
 KB = "higold_kb"
@@ -44,33 +45,75 @@ def split_parent_child(text: str) -> list:
     return out
 
 
-def extract_text(path: str) -> str:
-    """按扩展名抽正文：PDF 用 pypdf，docx 用 python-docx（段落 + 表格）
+def extract_pages(path: str) -> tuple:
+    """按格式抽正文，并保留"页码锚点"
 
-    build_kb.py（本地建库）和 app.py（云端兜底建库）都从这里拿，
-    保证两种入口对同一份文件抽出的文字完全一致。
+    返回 (全文, marks)。
+    marks = [(该页第一个字符在全文中的偏移, 页码), ...]，PDF 按物理页记录；
+    docx 没有分页概念（Word 的分页是渲染结果，文件里不存在），
+    marks 返回 []，下游页码显示为空。
     """
     ext = os.path.splitext(path)[1].lower()
     if ext == ".pdf":
         from pypdf import PdfReader
-        return "\n".join(p.extract_text() or "" for p in PdfReader(path).pages)
+        parts, marks, pos = [], [], 0
+        for i, pg in enumerate(PdfReader(path).pages, start=1):
+            t = pg.extract_text() or ""
+            marks.append((pos, i))
+            parts.append(t)
+            pos += len(t) + 1                      # +1 是页与页之间的换行符
+        return "\n".join(parts), marks
     if ext == ".docx":
-        from docx import Document as _Doc
-        doc = _Doc(path)
-        parts = [p.text for p in doc.paragraphs]
-        # 制度文件常把审批权限、标准放表格里，表格内容一并抽出
-        parts += ["  ".join(c.text.strip() for c in row.cells)
-                  for tbl in doc.tables for row in tbl.rows]
-        return "\n".join(x for x in parts if x)
+        return _extract_docx(path), []
     raise ValueError(f"不支持的文件格式：{ext}（目前支持 PDF / docx，"
                      f"其他格式请先另存为 docx 或 PDF）")
+
+
+def _extract_docx(path: str) -> str:
+    from docx import Document as _Doc
+    doc = _Doc(path)
+    parts = [p.text for p in doc.paragraphs]
+    # 制度文件常把审批权限、标准放表格里，表格内容一并抽出
+    parts += ["  ".join(c.text.strip() for c in row.cells)
+              for tbl in doc.tables for row in tbl.rows]
+    return "\n".join(x for x in parts if x)
+
+
+def extract_text(path: str) -> str:
+    """只要正文不要页码时的便捷入口（兼容旧调用）"""
+    return extract_pages(path)[0]
+
+
+def page_label(text: str, chunk: str, marks, cursor: int = 0) -> tuple:
+    """定位 chunk 在全文中的位置 -> 页码标签，如 "4" 或 "4-5"
+
+    marks 为空（docx / 云端公开版）时返回 ("", 原游标)。
+    cursor 是顺序游标：块按文档顺序处理，从上一块之后开始找，
+    避免重复文本定位到前面的同名段落。
+    返回 (页码标签, 新游标)。
+    """
+    if not marks:
+        return "", cursor
+    idx = text.find(chunk, cursor)
+    if idx == -1:                                  # 兜底：从头再找一次
+        idx = text.find(chunk)
+    if idx == -1:                                  # 真找不到（理论不该发生）
+        return "", cursor
+    starts = [m[0] for m in marks]
+    a = bisect.bisect_right(starts, idx) - 1
+    b = bisect.bisect_right(starts, idx + max(len(chunk) - 1, 0)) - 1
+    pa = marks[max(a, 0)][1]
+    pb = marks[max(b, 0)][1]
+    label = f"{pa}" if pa == pb else f"{pa}-{pb}"
+    return label, idx + 1
 
 
 def index_docs(db, items, embed_client, batch_size: int = 16, log=print) -> dict:
     """建库：写子块向量索引，父块正文随子块 metadata 一起存
 
-    items: [(source, category, text, vis_fn)]
+    items: [(source, category, text, vis_fn[, page_marks])]
            vis_fn(child_text) -> "public" / "internal"，云端可传 lambda c: "public"
+           page_marks 是 extract_pages 返回的页码锚点，缺省/None 时页码存空串
     返回：{"children": 子块数, "parents": 父块数}
     """
     try:
@@ -80,21 +123,28 @@ def index_docs(db, items, embed_client, batch_size: int = 16, log=print) -> dict
     col = db.get_or_create_collection(KB)
 
     n_child = n_parent = 0
-    for source, category, text, vis_fn in items:
+    for item in items:
+        source, category, text, vis_fn = item[:4]
+        marks = item[4] if len(item) > 4 else None
         pairs = split_parent_child(text)
+        cursor = 0                            # 页码定位游标：块按文档顺序处理
         for parent, kids in pairs:
             pid = f"p{n_parent}"
             n_parent += 1
             for i in range(0, len(kids), batch_size):
                 batch = kids[i:i + batch_size]
+                labels = []
+                for c in batch:               # 先定位每块的页码，再批量向量化
+                    label, cursor = page_label(text, c, marks, cursor)
+                    labels.append(label)
                 res = embed_client.embeddings.create(model="BAAI/bge-m3", input=batch)
                 col.add(ids=[f"c{n_child + j}" for j in range(len(batch))],
                         documents=batch,
                         embeddings=[d.embedding for d in res.data],
                         metadatas=[{"source": source, "category": category,
                                     "parent_id": pid, "parent": parent,
-                                    "visibility": vis_fn(c)}
-                                   for c in batch])
+                                    "visibility": vis_fn(c), "page": labels[j]}
+                                   for j, c in enumerate(batch)])
                 n_child += len(batch)
         log(f"  [建库] {source}: {len(pairs)} 父块 / 子块 {n_child} 累计")
     return {"children": n_child, "parents": n_parent}

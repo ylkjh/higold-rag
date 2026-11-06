@@ -144,7 +144,8 @@ def hybrid_search(db, question: str, embed_client, api_key: str,
       召回池，最终排序交给 rerank；rerank 不可用时退回纯向量顺序。
 
     返回 {"context": 拼好的上下文文本, "hits": [...], "debug": {...}}
-    hits 里每项：{"source","category","score","child","parent"}
+    hits 里每项：{"source","category","score","child","parent","page"}
+    page 是检索命中的子块所在页码（PDF 有值，docx/云端公开版为空串）。
     """
     col = db.get_collection(KB)
     idx = _index_of(col)
@@ -196,10 +197,16 @@ def hybrid_search(db, question: str, embed_client, api_key: str,
                      "category": meta.get("category", ""),
                      "score": round(float(score), 4),
                      "child": doc_map.get(cid, ""),
+                     "page": meta.get("page", ""),
                      "parent_id": pid,
                      "parent": meta.get("parent") or doc_map.get(cid, "")})
 
-    context = "\n----\n".join(f"《{h['source']}》\n{h['parent']}" for h in hits)
+    # 资料头带上页码，模型标注"依据"时才有页码可抄
+    def _head(h):
+        page = h.get("page") or ""
+        return f"《{h['source']}》" + (f"（第 {page} 页）" if page else "")
+
+    context = "\n----\n".join(f"{_head(h)}\n{h['parent']}" for h in hits)
     return {"context": context, "hits": hits,
             "debug": {"vector_hits": len(vec_ids), "bm25_hits": len(bm25_ids),
                       "fused": len(fused_ids), "rerank_used": bool(scored),
