@@ -65,8 +65,10 @@ def extract_pages(path: str) -> tuple:
         return "\n".join(parts), marks
     if ext == ".docx":
         return _extract_docx(path), []
-    raise ValueError(f"不支持的文件格式：{ext}（目前支持 PDF / docx，"
-                     f"其他格式请先另存为 docx 或 PDF）")
+    if ext == ".xlsx":
+        return _extract_xlsx(path), []
+    raise ValueError(f"不支持的文件格式：{ext}（目前支持 PDF / docx / xlsx，"
+                     f"其他格式请先另存为 docx、xlsx 或 PDF）")
 
 
 def _extract_docx(path: str) -> str:
@@ -77,6 +79,26 @@ def _extract_docx(path: str) -> str:
     parts += ["  ".join(c.text.strip() for c in row.cells)
               for tbl in doc.tables for row in tbl.rows]
     return "\n".join(x for x in parts if x)
+
+
+def _extract_xlsx(path: str) -> str:
+    """Excel：每个工作表逐行读，单元格拼接成一句话一行
+
+    行内的单元格用「｜」分隔，行与行之间换行——这样"岗位｜审批人｜额度"
+    这类表结构切块后仍保持列对应关系，检索和阅读都友好。
+    空行/全空单元格跳过；工作表名做一行的"节标题"，方便定位内容主题。
+    """
+    from openpyxl import load_workbook
+    wb = load_workbook(path, read_only=True, data_only=True)
+    lines = []
+    for ws in wb.worksheets:
+        lines.append(f"【{ws.title}】")
+        for row in ws.iter_rows(values_only=True):
+            cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
+            if cells:
+                lines.append("｜".join(cells))
+    wb.close()
+    return "\n".join(lines)
 
 
 def extract_text(path: str) -> str:

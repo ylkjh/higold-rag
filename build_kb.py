@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""悍高知识库建库脚本：docs/ 里所有 PDF / docx -> 分级 -> 切父子块 -> 向量化 -> 存入 Chroma
+"""悍高知识库建库脚本：docs/ 里所有 PDF / docx / xlsx -> 分级 -> 切父子块 -> 向量化 -> 存入 Chroma
 --------------------------------------------------------------------------
 一次运行做三件事：
 
@@ -25,7 +25,7 @@
   FORCE_PUBLIC    整份强制公开（仅用于确认过不含敏感内容的文件）
 
 怎么加新资料：
-  1. 把 PDF 或 docx 丢进 docs/（其他格式先另存为这两种）
+  1. 把 PDF / docx / xlsx 丢进 docs/（其他格式先另存为这几种）
   2. 运行  python build_kb.py
   类别与公开范围都会自动判定。
 --------------------------------------------------------------------------
@@ -142,9 +142,9 @@ def rebuild(pdf_names: list, do_index: bool = True) -> None:
 
 docs_dir = os.path.join(BASE, "docs")
 docs = sorted(f for f in os.listdir(docs_dir)
-              if f.lower().endswith((".pdf", ".docx")))
+              if f.lower().endswith((".pdf", ".docx", ".xlsx")))
 if not docs:
-    raise SystemExit("docs/ 里没有 PDF 或 docx，请先放入资料（其他格式请先另存为这两种）")
+    raise SystemExit("docs/ 里没有 PDF / docx / xlsx，请先放入资料（其他格式请先另存）")
 
 rebuild(docs, do_index="--export-only" not in __import__("sys").argv)
 

@@ -172,7 +172,7 @@ def kb_ready() -> bool:
 def load_docs() -> list:
     """准备建库原料，返回 [(source, category, text), ...]
 
-    本地：docs/ 里有原始 PDF / docx -> 全量读（含内部内容，只在本机）
+    本地：docs/ 里有原始 PDF / docx / xlsx -> 全量读（含内部内容，只在本机）
           返回 (来源名, 类别, 正文, 页码锚点) 四元组
     云端：PDF 从未上传，只有 docs/public/*.txt（建库时导出的脱敏公开版）
            -> 读这些 txt，云端因此只可能拿到可公开的片段
@@ -181,7 +181,7 @@ def load_docs() -> list:
     out = []
     docs_dir = os.path.join(BASE, "docs")
     files = sorted(f for f in os.listdir(docs_dir)
-                   if f.lower().endswith((".pdf", ".docx"))) \
+                   if f.lower().endswith((".pdf", ".docx", ".xlsx"))) \
         if os.path.isdir(docs_dir) else []
     if files:
         for name in files:
@@ -205,7 +205,7 @@ def ensure_kb():
     from langchain_text_splitters import RecursiveCharacterTextSplitter  # noqa: F401
     docs = load_docs()
     if not docs:
-        st.error("没有找到任何资料：本地需要 docs/ 里有 PDF 或 docx，云端需要 docs/public/*.txt")
+        st.error("没有找到任何资料：本地需要 docs/ 里有 PDF / docx / xlsx，云端需要 docs/public/*.txt")
         return
     with st.spinner("首次启动，正在建知识库（切块 + 向量化），约 20 秒……"):
         res = index_docs(db, [(s, c, t, (lambda _c: "public"), m)
@@ -473,6 +473,16 @@ if "messages" not in st.session_state:
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.write(m["content"])
+
+# ---------- 首次打开的欢迎卡：让新用户 10 秒知道这是什么、怎么用 ----------
+if not st.session_state.messages:
+    n_files = sum(f for _k, _l, f, _c in stats)
+    st.info(
+        f"👋 **你好，我是悍高知识库助手。** 基于公司 **{n_files} 份制度资料**回答问题，"
+        "答案均标注出处（本地版精确到页码）。\n\n"
+        "下方是按资料内容生成的推荐问题，点一下即可提问；"
+        "也可以直接在输入框输入，支持多轮追问。左侧 **📚 资料一览** 可查看收录范围。"
+    )
 
 # ---------- 提问引导：有"相关问题"就优先显示它，否则显示常规推荐 ----------
 clicked = None
