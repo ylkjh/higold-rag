@@ -68,8 +68,8 @@ def brand_bg_css() -> str:
     b64 = base64.b64encode(open(path, "rb").read()).decode()
     return ("<style>.stApp{"
             "background-image:"
-            "linear-gradient(180deg,rgba(255,255,255,.88) 0%,"
-            "rgba(255,255,255,.80) 45%,rgba(255,255,255,.92) 100%),"
+            "linear-gradient(180deg,rgba(255,255,255,.80) 0%,"
+            "rgba(255,255,255,.70) 45%,rgba(255,255,255,.88) 100%),"
             "url('" + "data:image/jpeg;base64," + b64 + "');"
             "background-size:cover;background-position:center;"
             "background-attachment:fixed;background-repeat:no-repeat;}"
