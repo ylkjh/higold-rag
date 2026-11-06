@@ -55,6 +55,31 @@ st.set_page_config(page_title="悍高知识库问答", page_icon="🏢", layout=
 st.title("🏢 悍高知识库问答")
 st.caption("基于资料的 RAG 问答 · 答案只来自手册原文")
 
+
+# ---------- 品牌背景：悍高总部大楼 ----------
+# 图压成 44KB 的 JPEG 后 base64 内嵌进 CSS：不依赖外链，云端同样能显示；
+# 上面盖一层半透明白纱（渐变），正文照常可读，边缘透出大楼品牌感。
+# 图片缺失时返回空串，页面自动退回纯色背景，不影响运行。
+def brand_bg_css() -> str:
+    path = os.path.join(BASE, "assets", "higold_bg.jpg")
+    if not os.path.exists(path):
+        return ""
+    import base64
+    b64 = base64.b64encode(open(path, "rb").read()).decode()
+    return ("<style>.stApp{"
+            "background-image:"
+            "linear-gradient(180deg,rgba(255,255,255,.88) 0%,"
+            "rgba(255,255,255,.80) 45%,rgba(255,255,255,.92) 100%),"
+            "url('" + "data:image/jpeg;base64," + b64 + "');"
+            "background-size:cover;background-position:center;"
+            "background-attachment:fixed;background-repeat:no-repeat;}"
+            "</style>")
+
+
+_bg = brand_bg_css()
+if _bg:
+    st.markdown(_bg, unsafe_allow_html=True)
+
 # ---------- 访问控制：不设登录门，靠"每个 IP 每日配额"防刷 ----------
 # 设计取舍：不做账号登录、不发密码、不发链接，谁有网址都能打开，
 # 但同一个 IP 每天只能问 DAILY_QUOTA 次，全站每天有总量上限（熔断）。
