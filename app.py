@@ -350,25 +350,28 @@ def ask(question: str):
             yield chunk.choices[0].delta.content
 
 
-# ---------- 侧边栏：内容大类 + 清空对话 ----------
+# ---------- 侧边栏：提问方向 + 资料一览（折叠） + 剩余额度 ----------
 with st.sidebar:
-    st.markdown("### 📂 资料类别")
+    st.markdown("### 📂 提问方向")
     stats = category_stats(KB, col.count())
     key_of = {label: k for k, label, _f, _c in stats}          # 显示名 -> 内部代号
     options = ["全部资料"] + [label for _k, label, _f, _c in stats]
-    picked = st.radio("想了解哪方面？", options, index=0,
-                      label_visibility="collapsed")
+    picked = st.selectbox("想了解哪方面？", options, index=0,
+                          label_visibility="collapsed")
     CATEGORY = key_of.get(picked) if picked != "全部资料" else None
 
-    # 每个类别下面标注资料份数，让人知道这块有什么
-    for _k, label, files, chunks in stats:
-        st.caption(f"· {label}：{files} 份资料 / {chunks} 个片段")
+    # 资料份数/片段数多数用户不关心：收进折叠面板，想看再点开
+    with st.expander("📚 资料一览"):
+        for _k, label, files, chunks in stats:
+            st.caption(f"· {label}：{files} 份资料 / {chunks} 个片段")
+        st.caption("类别只影响推荐提问的方向，搜索始终覆盖全部资料")
 
-    st.caption("提示：类别只影响下方推荐提问的方向，搜索始终覆盖全部资料")
+    # 额度只说用户自己的，规则文案与全站总量不放出来
     _s = guard.stats(WHO, DAILY_QUOTA, DAILY_GLOBAL_LIMIT)
-    st.caption(f"🌐 公开访问 · 每个 IP 每天 {DAILY_QUOTA} 次")
-    st.caption(f"🧮 你今天还可提问 {_s['who_left']} 次")
-    st.caption(f"全站今日剩余额度：{_s['global_left']} / {DAILY_GLOBAL_LIMIT} 次")
+    used = DAILY_QUOTA - max(0, _s["who_left"])
+    st.caption(f"🧮 今日还可提问 **{_s['who_left']}** 次")
+    st.progress(min(1.0, used / DAILY_QUOTA))
+
     if st.button("🗑️ 清空对话", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
