@@ -474,16 +474,6 @@ for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.write(m["content"])
 
-# ---------- 首次打开的欢迎卡：让新用户 10 秒知道这是什么、怎么用 ----------
-if not st.session_state.messages:
-    n_files = sum(f for _k, _l, f, _c in stats)
-    st.info(
-        f"👋 **你好，我是悍高知识库助手。** 基于公司 **{n_files} 份制度资料**回答问题，"
-        "答案均标注出处（本地版精确到页码）。\n\n"
-        "下方是按资料内容生成的推荐问题，点一下即可提问；"
-        "也可以直接在输入框输入，支持多轮追问。左侧 **📚 资料一览** 可查看收录范围。"
-    )
-
 # ---------- 提问引导：有"相关问题"就优先显示它，否则显示常规推荐 ----------
 clicked = None
 if st.session_state.get("related"):
